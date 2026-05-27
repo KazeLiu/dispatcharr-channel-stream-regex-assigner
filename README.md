@@ -1,6 +1,9 @@
 # Channel Stream Regex Assigner
 
-Dispatcharr 插件：按正则规则把现有 Streams 自动挂到现有 Channels。
+Dispatcharr 插件：按正则规则把现有 Streams 自动挂到现有 Channels，按照规则排序频道里面的流，获取订阅中的EPG放到程序中订阅，等方便程序使用的功能
+
+![alt text](sc/QQ20260527-162442.jpg)
+![alt text](sc/QQ20260527-162453.jpg)
 
 ## 安装
 
@@ -9,12 +12,11 @@ Dispatcharr 插件：按正则规则把现有 Streams 自动挂到现有 Channel
 
 ## 推荐流程
 
-1. 点击 `生成模板`。
-2. 直接编辑 `/data/plugins/channel_stream_regex_assigner/exports/channel_rules_template.txt`。
-3. 可先填写 `测试正则` 并点击 `测试` 查看单条正则匹配数量。
-4. 点击 `预览` 生成 dry-run 报告。
-5. 确认报告无误后点击 `立即执行`。
-6. 后台任务运行时，可反复点击 `查看结果` 查看百分比进度，也可以在 Docker 日志里看到定时进度输出；完成后到插件目录 `exports/` 查看 txt 报告。
+1. 点击 `生成规则`。(我里面放了一份简单的，可以自己添加或者直接通过生成规则覆盖掉)
+2. 直接编辑 `/data/plugin_data/channel_stream_regex_assigner/channel_rules.txt`。
+3. 可先填写 `测试正则` 并点击 `测试` 查看单条正则匹配数量。也可以`预览规则匹配`来看整个规则最终的匹配流
+4. 确认报告无误后点击 `立即执行`。
+5. 后台任务运行时，可反复点击 `查看结果` 查看百分比进度，也可以在 Docker 日志里看到定时进度输出；完成后到插件目录 `exports/` 查看 txt 报告。
 
 ## 匹配结果排序
 
@@ -67,21 +69,21 @@ Dispatcharr 插件：按正则规则把现有 Streams 自动挂到现有 Channel
 20 ||| 湖南卫视 ||| ^湖南卫视.*$ ||| merge ||| 0
 ```
 
-- `channel_id`：优先按 ID 找频道。
-- `channel_name`：ID 找不到时可作为回退匹配名称，也方便人工查看。
+- `channel_id`：可选频道 ID，主要用于本机兼容；共享规则时可保留但不会优先使用。
+- `channel_name`：优先按频道名称找频道；如果多个频道同名，使用 ID 最小的第一个频道。
 - `regex`：默认匹配 Stream 名称；可在插件设置里改为 URL 或 名称+URL。
 - `mode`：`merge` 合并，`replace` 覆盖。
 - `max_streams`：最大流数量，`0` 表示无限。
 
 也兼容 Tab 分隔和 `空格 | 空格` 分隔。
 
-规则模板的默认导出路径：
+规则文件的默认持久路径：
 
 ```text
-/data/plugins/channel_stream_regex_assigner/exports/channel_rules_template.txt
+/data/plugin_data/channel_stream_regex_assigner/channel_rules.txt
 ```
 
-打开插件或执行动作时，如果该文件不存在，插件会自动创建一份空白格式模板。`生成模板` 会按当前 Channels 覆盖生成规则文件，执行前会要求确认。
+这个路径不在插件安装目录里，升级插件时不会被新 zip 覆盖。打开插件或执行动作时，如果该文件不存在，插件会先从旧路径 `/data/plugins/channel_stream_regex_assigner/exports/channel_rules_template.txt`、旧持久路径 `/data/plugin_data/channel_stream_regex_assigner/channel_rules_template.txt` 或随包 `channel_rules.txt` 自动迁移；仍不存在才创建一份空白规则文件。`生成规则` 会按当前 Channels 覆盖生成规则文件，执行前会要求确认。
 
 ## 去重逻辑
 
