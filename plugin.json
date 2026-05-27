@@ -1,0 +1,210 @@
+{
+  "name": "Channel Stream Regex Assigner",
+  "version": "0.2.16",
+  "description": "Use regex rules to attach Streams to Channels and import EPG URLs from M3U headers.",
+  "author": "Fengbao",
+  "fields": [
+    {
+      "id": "usage",
+      "label": "规则格式",
+      "type": "info",
+      "description": "规则只从文件读取：/data/plugins/channel_stream_regex_assigner/exports/channel_rules_template.txt。每行格式：channel_id ||| channel_name ||| regex ||| mode ||| max_streams。mode 为 merge 或 replace，max_streams 为 0 表示无限。打开插件或执行动作时，如果该文件不存在，会自动创建一份空白格式模板。"
+    },
+    {
+      "id": "default_mode",
+      "label": "默认模式",
+      "type": "select",
+      "default": "merge",
+      "options": [
+        { "value": "merge", "label": "合并" },
+        { "value": "replace", "label": "覆盖" }
+      ]
+    },
+    {
+      "id": "default_max_streams",
+      "label": "默认最大流数量",
+      "type": "number",
+      "default": 0,
+      "help_text": "规则行未填写 max_streams 时使用此值；0 表示无限。"
+    },
+    {
+      "id": "stream_group_filter",
+      "label": "限制 Stream 分组",
+      "type": "string",
+      "default": "",
+      "placeholder": "Sports, News",
+      "help_text": "可选，逗号分隔 ChannelGroup 名称；留空则扫描全部 Streams。"
+    },
+    {
+      "id": "stream_keyword_priority",
+      "label": "关键词优先",
+      "type": "string",
+      "default": "",
+      "placeholder": "4k,mcp",
+      "help_text": "可选，逗号分隔关键词；同一频道匹配到的 Streams 会优先按关键词顺序排列，例如先 4k 再 mcp。"
+    },
+    {
+      "id": "stream_source_priority",
+      "label": "订阅源优先",
+      "type": "string",
+      "default": "",
+      "placeholder": "Source-A,Source-B",
+      "help_text": "可选，逗号分隔 M3U 订阅源名称；会先排你填写的订阅源中的关键词命中流，再排这些订阅源的其他流，最后排未列出的订阅源。"
+    },
+    {
+      "id": "only_empty_channels",
+      "label": "只处理空频道",
+      "type": "boolean",
+      "default": false
+    },
+    {
+      "id": "skip_stale_streams",
+      "label": "跳过过期流",
+      "type": "boolean",
+      "default": true
+    },
+    {
+      "id": "ignore_case",
+      "label": "正则忽略大小写",
+      "type": "boolean",
+      "default": true
+    },
+    {
+      "id": "allow_empty_replace",
+      "label": "允许空匹配覆盖清空频道",
+      "type": "boolean",
+      "default": false,
+      "help_text": "默认关闭，避免 replace 规则没有匹配到流时误清空频道。"
+    },
+    {
+      "id": "auto_on_m3u_refresh",
+      "label": "M3U 刷新后自动执行",
+      "type": "boolean",
+      "default": true,
+      "help_text": "监听 Dispatcharr 的 m3u_refresh 事件，刷新完成后自动排队执行。"
+    },
+    {
+      "id": "m3u_refresh_delay_minutes",
+      "label": "M3U 刷新后延迟分钟",
+      "type": "number",
+      "default": 3,
+      "help_text": "M3U 刷新完成后等待几分钟再执行，避免与后续刷新任务抢资源。"
+    },
+    {
+      "id": "auto_import_m3u_epg",
+      "label": "自动导入 M3U 头部 EPG",
+      "type": "boolean",
+      "default": true,
+      "help_text": "从 M3U 文件头部读取 x-tvg-url/url-tvg/tvg-url，并自动添加到 EPG Sources。备注：只会扫描文件开头一点点，EPG 地址不在开头时就跳过。"
+    },
+    {
+      "id": "refresh_epg_after_import",
+      "label": "导入后拉取 EPG",
+      "type": "boolean",
+      "default": true,
+      "help_text": "新建 EPGSource 后 Dispatcharr 会自动拉取；已有 EPGSource 命中时，打开此项会再排队刷新一次。"
+    },
+    {
+      "id": "test_regex",
+      "label": "测试正则",
+      "type": "string",
+      "default": "",
+      "placeholder": "^CCTV[-_ ]?1($|高清|HD)",
+      "help_text": "只用于单独测试一条正则会命中哪些 Streams，不会修改频道规则，也不会写入频道。"
+    },
+    {
+      "id": "test_target",
+      "label": "正则匹配字段",
+      "type": "select",
+      "default": "name",
+      "help_text": "测试正则时用哪个 Stream 字段作为被匹配内容；正式执行规则也使用这里选择的字段。",
+      "options": [
+        { "value": "name", "label": "Stream 名称" },
+        { "value": "url", "label": "Stream URL" },
+        { "value": "both", "label": "名称 + URL" }
+      ]
+    }
+  ],
+  "actions": [
+    {
+      "id": "generate_template",
+      "label": "生成频道规则模板",
+      "description": "读取当前 Channels 生成规则模板，并覆盖已有 channel_rules_template.txt。",
+      "button_label": "生成模板",
+      "button_variant": "light",
+      "button_color": "blue",
+      "confirm": {
+        "required": true,
+        "title": "生成频道规则模板？",
+        "message": "这会覆盖 /data/plugins/channel_stream_regex_assigner/exports/channel_rules_template.txt，现有手工修改会丢失。"
+      }
+    },
+    {
+      "id": "test_regex",
+      "label": "测试正则",
+      "description": "使用测试正则扫描 Streams，生成匹配明细报告。",
+      "button_label": "测试",
+      "button_variant": "light",
+      "button_color": "cyan"
+    },
+    {
+      "id": "preview_match",
+      "label": "预览规则匹配",
+      "description": "后台预览所有规则，不写入 ChannelStream。",
+      "button_label": "预览",
+      "button_variant": "light",
+      "button_color": "yellow"
+    },
+    {
+      "id": "apply_match",
+      "label": "立即执行规则匹配",
+      "description": "后台写入 ChannelStream 关系。",
+      "button_label": "立即执行",
+      "button_variant": "filled",
+      "button_color": "green",
+      "confirm": {
+        "required": true,
+        "title": "执行频道挂流？",
+        "message": "这会根据规则修改 Channel 与 Stream 的关联。建议先运行预览。"
+      }
+    },
+    {
+      "id": "sort_existing_streams",
+      "label": "重排已挂流",
+      "description": "只对已经添加到频道里的 Streams 按关键词优先和订阅源优先重排一次，不新增或删除流。",
+      "button_label": "重排已挂流",
+      "button_variant": "light",
+      "button_color": "violet",
+      "confirm": {
+        "required": true,
+        "title": "重排已挂流？",
+        "message": "这只会更新频道内已挂 Streams 的顺序，不会新增或删除 Streams。有规则文件时只处理规则里的频道；规则文件为空时处理全部已有挂流频道。"
+      }
+    },
+    {
+      "id": "scan_m3u_epg",
+      "label": "扫描并导入 M3U EPG",
+      "description": "读取 M3U 文件开头的 x-tvg-url/url-tvg/tvg-url，自动添加到 EPG Sources 并拉取。",
+      "button_label": "扫描 EPG",
+      "button_variant": "light",
+      "button_color": "teal"
+    },
+    {
+      "id": "auto_m3u_refresh",
+      "label": "M3U 刷新后自动执行",
+      "description": "当 Dispatcharr 发出 m3u_refresh 事件时，延迟扫描 EPG 并执行匹配。",
+      "button_label": "手动模拟",
+      "button_variant": "subtle",
+      "button_color": "gray",
+      "events": ["m3u_refresh"]
+    },
+    {
+      "id": "latest_result",
+      "label": "查看最近结果",
+      "description": "读取最近一次模板、测试、预览或执行报告摘要；后台任务运行中会显示进度百分比，同时 Docker 日志也会定时输出进度。",
+      "button_label": "查看结果",
+      "button_variant": "subtle",
+      "button_color": "gray"
+    }
+  ]
+}
