@@ -3,6 +3,7 @@ import os
 import re
 import gzip
 import zipfile
+import shutil
 import threading
 import time
 import uuid
@@ -13,8 +14,10 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 PLUGIN_KEY = "channel_stream_regex_assigner"
 EXPORT_DIR = "exports"
+PLUGIN_DATA_DIR = "plugin_data"
 LAST_RESULT_FILE = "last_result.json"
-RULES_TEMPLATE_FILENAME = "channel_rules_template.txt"
+RULES_FILE_NAME = "channel_rules.txt"
+LEGACY_RULES_TEMPLATE_FILENAME = "channel_rules_template.txt"
 RULE_DELIMITERS = ("|||", "\t")
 PROGRESS_LOG_INTERVAL_SECONDS = 5
 EPG_URL_ATTR_RE = re.compile(
@@ -39,7 +42,7 @@ class Rule:
 
 class Plugin:
     name = "Channel Stream Regex Assigner"
-    version = "0.2.16"
+    version = "0.2.18"
     description = "Use regex rules to attach Streams to Channels and import EPG URLs from M3U headers."
     author = "Fengbao"
 
@@ -48,7 +51,7 @@ class Plugin:
 
     def __init__(self):
         try:
-            _ensure_rules_template_file(_plugin_dir())
+            _ensure_rules_file(_plugin_dir())
         except Exception:
             pass
         manifest = _read_own_manifest()
@@ -60,13 +63,13 @@ class Plugin:
         logger = context.get("logger")
         plugin_dir = _plugin_dir()
 
-        if action == "generate_template":
-            result = generate_channel_template(settings, plugin_dir, overwrite=True)
+        if action in ("generate_rules", "generate_template"):
+            result = generate_channel_rules_file(settings, plugin_dir, overwrite=True)
             return {
                 "status": "ok",
                 "message": (
-                    f"模板已生成：{result['channel_count']} 个频道。"
-                    f"请直接编辑模板文件：{result['file']}"
+                    f"规则文件已生成：{result['channel_count']} 个频道。"
+                    f"请直接编辑规则文件：{result['file']}"
                 ),
                 "file": result["file"],
                 "channel_count": result["channel_count"],
@@ -1034,7 +1037,7 @@ def _dedupe_strings(values: Iterable[str]) -> List[str]:
     return result
 
 
-def generate_channel_template(
+def generate_channel_rules_file(
     settings: Dict[str, Any],
     plugin_dir: str,
     *,
@@ -1044,12 +1047,12 @@ def generate_channel_template(
 
     default_mode = _mode(settings.get("default_mode"), "merge")
     default_max = _max_streams(settings.get("default_max_streams"), 0)
-    content, channel_count = _build_channel_template_content(
+    content, channel_count = _build_channel_rules_content(
         Channel.objects.all().order_by("channel_number", "name", "id"),
         default_mode=default_mode,
         default_max=default_max,
     )
-    write_result = _write_rules_template_file(
+    write_result = _write_rules_file(
         plugin_dir,
         content,
         overwrite=overwrite,
@@ -1058,9 +1061,9 @@ def generate_channel_template(
     result = {
         "status": write_result["status"],
         "message": (
-            f"模板生成完成：{file_path}"
+            f"规则文件生成完成：{file_path}"
             if write_result["written"]
-            else f"模板已存在，未覆盖：{file_path}"
+            else f"规则文件已存在，未覆盖：{file_path}"
         ),
         "file": file_path,
         "channel_count": channel_count,
@@ -1072,21 +1075,21 @@ def generate_channel_template(
     return result
 
 
-def _build_channel_template_content(channels, default_mode: str, default_max: int) -> Tuple[str, int]:
+def _build_channel_rules_content(channels, default_mode: str, default_max: int) -> Tuple[str, int]:
     lines = [
-        "# Channel Stream Regex Assigner 规则模板",
+        "# Channel Stream Regex Assigner 规则文件",
         "#",
         "# 用法：每个非注释行对应一个频道规则；以 # 开头的行会被忽略。",
         "# 推荐分隔符：|||，不要改成单个 |，否则正则里的 | 可能被误拆。",
-        "# 编辑完成后保存本文件即可；插件会直接读取这个模板文件。",
+        "# 编辑完成后保存本文件即可；插件会直接读取这个规则文件。",
         "# 如果需要重新生成，请先确认是否覆盖现有手工修改。",
         "# 建议回到插件页面先点“预览”，确认报告无误后再点“立即执行”。",
         "#",
         "# channel_id ||| channel_name ||| regex ||| mode ||| max_streams",
         "#",
         "# 字段说明：",
-        "# - channel_id: 频道 ID，优先按它查找频道，最稳定。",
-        "# - channel_name: 频道名称，主要给人看；ID 找不到时作为回退匹配。",
+        "# - channel_id: 可选频道 ID，主要用于本机兼容；共享规则时可保留但不会优先使用。",
+        "# - channel_name: 频道名称，优先按它查找频道；重名时使用 ID 最小的第一个频道。",
         "# - regex: 用来匹配 Stream 的正则；匹配字段由插件设置里的“正则测试字段”决定。",
         "# - mode: merge 或 replace。merge=合并，保留已有 Streams；replace=覆盖已有 Streams。",
         "# - max_streams: 最大添加流数量，0 表示无限。",
@@ -1278,36 +1281,42 @@ def parse_rules(
 
 def _load_rules_text(settings: Dict[str, Any], plugin_dir: str = "") -> Tuple[str, str]:
     if not plugin_dir:
-        return "", f"missing {RULES_TEMPLATE_FILENAME}"
+        return "", f"missing {RULES_FILE_NAME}"
 
-    template_path = _ensure_rules_template_file(plugin_dir)
-    if os.path.isfile(template_path):
-        with open(template_path, "r", encoding="utf-8") as fh:
-            return fh.read(), template_path
-    return "", template_path
+    rules_path = _ensure_rules_file(plugin_dir)
+    if os.path.isfile(rules_path):
+        with open(rules_path, "r", encoding="utf-8") as fh:
+            return fh.read(), rules_path
+    return "", rules_path
 
 
-def _ensure_rules_template_file(plugin_dir: str) -> str:
-    template_path = _rules_template_path(plugin_dir)
-    if os.path.isfile(template_path):
-        return template_path
+def _ensure_rules_file(plugin_dir: str) -> str:
+    rules_path = _rules_file_path(plugin_dir)
+    if os.path.isfile(rules_path):
+        return rules_path
 
-    return _write_rules_template_file(
+    for source_path in _rules_file_seed_paths(plugin_dir):
+        if os.path.isfile(source_path):
+            os.makedirs(os.path.dirname(rules_path), exist_ok=True)
+            shutil.copyfile(source_path, rules_path)
+            return rules_path
+
+    return _write_rules_file(
         plugin_dir,
-        _empty_rules_template_content(),
+        _empty_rules_file_content(),
         overwrite=False,
         create_if_missing=True,
     )["file"]
 
 
-def _write_rules_template_file(
+def _write_rules_file(
     plugin_dir: str,
     content: str,
     *,
     overwrite: bool = False,
     create_if_missing: bool = True,
 ) -> Dict[str, Any]:
-    file_path = _rules_template_path(plugin_dir)
+    file_path = _rules_file_path(plugin_dir)
     exists = os.path.isfile(file_path)
     if exists and not overwrite:
         return {"status": "exists", "file": file_path, "written": False}
@@ -1318,20 +1327,28 @@ def _write_rules_template_file(
     return {"status": "missing", "file": file_path, "written": False}
 
 
-def _empty_rules_template_content() -> str:
+def _empty_rules_file_content() -> str:
     return "\n".join(
         [
-            "# Channel Stream Regex Assigner 规则模板",
+            "# Channel Stream Regex Assigner 规则文件",
             "#",
-            "# 请按以下格式填写频道规则，或使用“生成模板”按当前 Channels 生成初始内容：",
+            "# 请按以下格式填写频道规则，或使用“生成规则”按当前 Channels 生成初始内容：",
             "# channel_id ||| channel_name ||| regex ||| mode ||| max_streams",
             "",
         ]
     ) + "\n"
 
 
-def _rules_template_path(plugin_dir: str) -> str:
-    return os.path.join(_exports_dir(plugin_dir), RULES_TEMPLATE_FILENAME)
+def _rules_file_path(plugin_dir: str) -> str:
+    return os.path.join(_rules_data_dir(plugin_dir), RULES_FILE_NAME)
+
+
+def _rules_file_seed_paths(plugin_dir: str) -> List[str]:
+    return [
+        os.path.join(plugin_dir, EXPORT_DIR, LEGACY_RULES_TEMPLATE_FILENAME),
+        os.path.join(_rules_data_dir(plugin_dir), LEGACY_RULES_TEMPLATE_FILENAME),
+        os.path.join(plugin_dir, RULES_FILE_NAME),
+    ]
 
 
 def _split_rule_line(line: str) -> List[str]:
@@ -1470,11 +1487,16 @@ def _stream_source_name(stream: Any) -> str:
 
 def _find_channel(Channel, channel_ref: str, channel_name: str):
     ref = str(channel_ref or "").strip()
+    name = str(channel_name or "").strip()
+    if name:
+        channel = Channel.objects.filter(name=name).order_by("id").first()
+        if channel:
+            return channel
     if ref.isdigit():
         channel = Channel.objects.filter(id=int(ref)).first()
         if channel:
             return channel
-    name = channel_name or ref
+    name = ref
     if not name:
         return None
     return Channel.objects.filter(name=name).order_by("id").first()
@@ -1595,6 +1617,16 @@ def _plugin_dir() -> str:
 
 def _exports_dir(plugin_dir: str) -> str:
     path = os.path.join(plugin_dir, EXPORT_DIR)
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def _rules_data_dir(plugin_dir: str) -> str:
+    plugins_root = os.path.dirname(os.path.abspath(plugin_dir))
+    data_root = os.environ.get("DISPATCHARR_PLUGIN_DATA_DIR")
+    if not data_root:
+        data_root = os.path.join(os.path.dirname(plugins_root), PLUGIN_DATA_DIR)
+    path = os.path.join(data_root, PLUGIN_KEY)
     os.makedirs(path, exist_ok=True)
     return path
 
