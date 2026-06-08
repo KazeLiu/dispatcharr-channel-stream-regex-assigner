@@ -16,10 +16,12 @@ PLUGIN_KEY = "channel_stream_regex_assigner"
 EXPORT_DIR = "exports"
 PLUGIN_DATA_DIR = "plugin_data"
 LAST_RESULT_FILE = "last_result.json"
+JOB_STATE_FILE = "job_state.json"
 RULES_FILE_NAME = "channel_rules.txt"
 LEGACY_RULES_TEMPLATE_FILENAME = "channel_rules_template.txt"
 RULE_DELIMITERS = ("|||", "\t")
 PROGRESS_LOG_INTERVAL_SECONDS = 5
+JOB_STATE_STALE_SECONDS = 6 * 60 * 60
 EPG_URL_ATTR_RE = re.compile(
     r"(?:x-tvg-url|url-tvg|tvg-url)\s*=\s*([\"'])(.*?)\1",
     re.IGNORECASE,
@@ -28,6 +30,8 @@ EPG_URL_FALLBACK_RE = re.compile(
     r"https?://[^\s\"']+(?:\.xml|\.xml\.gz|\.xml\.zip|xmltv)[^\s\"']*",
     re.IGNORECASE,
 )
+LAST_RESULT_WRITE_LOCK = threading.Lock()
+JOB_STATE_LOCK = threading.Lock()
 
 
 @dataclass
@@ -42,7 +46,7 @@ class Rule:
 
 class Plugin:
     name = "Channel Stream Regex Assigner"
-    version = "0.2.18"
+    version = "0.3.1"
     description = "Use regex rules to attach Streams to Channels and import EPG URLs from M3U headers."
     author = "Fengbao"
 
@@ -99,7 +103,7 @@ class Plugin:
 
         if action in ("preview_match", "apply_match"):
             dry_run = action == "preview_match"
-            job_id = _start_background_job(
+            result = _start_background_job(
                 "preview_match" if dry_run else "apply_match",
                 plugin_dir,
                 run_channel_stream_regex_job,
@@ -110,15 +114,11 @@ class Plugin:
             )
             verb = "预览" if dry_run else "执行"
             if logger:
-                logger.info("%s queued background job %s", self.name, job_id)
-            return {
-                "status": "queued",
-                "message": f"{verb}任务已提交后台，任务 ID：{job_id}",
-                "task_id": job_id,
-            }
+                logger.info("%s background job result: %s", self.name, result)
+            return _format_background_job_result(result, f"{verb}任务已提交后台")
 
         if action == "sort_existing_streams":
-            job_id = _start_background_job(
+            result = _start_background_job(
                 "sort_existing_streams",
                 plugin_dir,
                 sort_existing_channel_streams,
@@ -126,14 +126,10 @@ class Plugin:
                 settings=settings,
                 plugin_dir=plugin_dir,
             )
-            return {
-                "status": "queued",
-                "message": f"已挂流重排任务已提交后台，任务 ID：{job_id}",
-                "task_id": job_id,
-            }
+            return _format_background_job_result(result, "已挂流重排任务已提交后台")
 
         if action == "scan_m3u_epg":
-            job_id = _start_background_job(
+            result = _start_background_job(
                 "scan_m3u_epg",
                 plugin_dir,
                 import_m3u_epg_sources,
@@ -142,11 +138,7 @@ class Plugin:
                 plugin_dir=plugin_dir,
                 payload={},
             )
-            return {
-                "status": "queued",
-                "message": f"M3U 头部 EPG 扫描任务已提交，任务 ID：{job_id}",
-                "task_id": job_id,
-            }
+            return _format_background_job_result(result, "M3U 头部 EPG 扫描任务已提交")
 
         if action == "auto_m3u_refresh":
             if not _truthy(settings.get("auto_on_m3u_refresh")):
@@ -158,7 +150,7 @@ class Plugin:
                 settings.get("m3u_refresh_delay_minutes"), 3
             )
             payload = params.get("payload", {}) if isinstance(params, dict) else {}
-            job_id = _start_background_job(
+            result = _start_background_job(
                 "auto_m3u_refresh",
                 plugin_dir,
                 handle_m3u_refresh_job,
@@ -168,22 +160,27 @@ class Plugin:
                 plugin_dir=plugin_dir,
                 payload=payload,
             )
-            return {
-                "status": "queued",
-                "message": (
-                    f"M3U 刷新成功事件已接收，将在 {delay_minutes} 分钟后扫描 EPG 并执行匹配，"
-                    f"任务 ID：{job_id}"
-                ),
-                "task_id": job_id,
-            }
+            return _format_background_job_result(
+                result,
+                f"M3U 刷新成功事件已接收，将在 {delay_minutes} 分钟后扫描 EPG 并执行匹配",
+            )
 
         if action == "latest_result":
             try:
                 result = read_latest_result(plugin_dir)
+                active_job = read_active_job_state(plugin_dir)
             except Exception as exc:
                 return {
                     "status": "error",
                     "message": f"读取最近结果失败：{exc}",
+                }
+            if active_job:
+                return {
+                    "status": "ok",
+                    "message": active_job.get("message", "已有后台任务正在执行。"),
+                    "file": result.get("file") if result else None,
+                    "summary": result,
+                    "active_job": active_job,
                 }
             if not result:
                 return {"status": "ok", "message": "还没有结果报告。"}
@@ -197,6 +194,22 @@ class Plugin:
         return {"status": "error", "message": f"Unknown action: {action}"}
 
 
+def _format_background_job_result(result: Dict[str, Any], queued_prefix: str) -> Dict[str, Any]:
+    if result.get("status") == "blocked":
+        return {
+            "status": "blocked",
+            "message": result.get("message", "已有后台任务正在执行，请稍后再试。"),
+            "active_job": result.get("active_job"),
+        }
+    job_id = result.get("job_id", "")
+    return {
+        "status": "queued",
+        "message": f"{queued_prefix}，任务 ID：{job_id}",
+        "task_id": job_id,
+        "active_job": result.get("job"),
+    }
+
+
 def _start_background_job(
     job_name: str,
     result_dir: str,
@@ -205,24 +218,14 @@ def _start_background_job(
     logger=None,
     delay_seconds: int = 0,
     **kwargs,
-) -> str:
-    job_id = str(uuid.uuid4())
+) -> Dict[str, Any]:
     job_kwargs = dict(kwargs)
     delay_seconds = max(int(delay_seconds or 0), 0)
-    _write_last_result(
-        result_dir,
-        {
-            "status": "running" if delay_seconds == 0 else "waiting",
-            "message": (
-                f"{_job_display_name(job_name)}任务"
-                f"{'正在后台运行' if delay_seconds == 0 else f'已排队，将在 {delay_seconds} 秒后运行'}。"
-                f"任务 ID：{job_id}"
-            ),
-            "job_id": job_id,
-            "job_name": job_name,
-            "started_at": _now_label(),
-        },
-    )
+    reservation = _reserve_background_job(result_dir, job_name, delay_seconds)
+    if reservation.get("status") == "blocked":
+        return reservation
+    job_id = reservation["job_id"]
+    _write_last_result(result_dir, reservation["job"])
 
     def runner():
         try:
@@ -234,19 +237,14 @@ def _start_background_job(
 
         if delay_seconds > 0:
             time.sleep(delay_seconds)
-            _write_last_result(
-                result_dir,
-                {
-                    "status": "running",
-                    "message": (
-                        f"{_job_display_name(job_name)}任务正在后台运行。"
-                        f"任务 ID：{job_id}"
-                    ),
-                    "job_id": job_id,
-                    "job_name": job_name,
-                    "started_at": _now_label(),
-                },
+            running_state = _job_state_payload(
+                job_id,
+                job_name,
+                "running",
+                f"{_job_display_name(job_name)}任务正在后台运行。任务 ID：{job_id}",
             )
+            _write_job_state(result_dir, running_state)
+            _write_last_result(result_dir, running_state)
 
         try:
             progress_log_state = {"last_at": 0.0, "last_message": ""}
@@ -269,6 +267,8 @@ def _start_background_job(
                 completed["job_id"] = job_id
                 completed["job_name"] = job_name
                 completed["finished_at"] = _now_label()
+                completed["status"] = completed.get("status") or "ok"
+                _write_job_state(result_dir, completed)
                 _write_last_result(result_dir, completed)
                 if logger:
                     logger.info(
@@ -288,6 +288,7 @@ def _start_background_job(
                     "job_name": job_name,
                     "finished_at": _now_label(),
                 }
+                _write_job_state(result_dir, completed)
                 _write_last_result(result_dir, completed)
                 if logger:
                     logger.info(
@@ -300,14 +301,15 @@ def _start_background_job(
             if logger:
                 logger.exception("%s background job %s failed", PLUGIN_KEY, job_id)
             try:
-                _write_last_result(
-                    result_dir,
-                    {
-                        "status": "error",
-                        "message": f"{job_name} 后台任务失败：{exc}",
-                        "job_id": job_id,
-                    },
-                )
+                failed = {
+                    "status": "error",
+                    "message": f"{job_name} 后台任务失败：{exc}",
+                    "job_id": job_id,
+                    "job_name": job_name,
+                    "finished_at": _now_label(),
+                }
+                _write_job_state(result_dir, failed)
+                _write_last_result(result_dir, failed)
             except Exception:
                 if logger:
                     logger.exception("%s failed to write error report", PLUGIN_KEY)
@@ -325,7 +327,107 @@ def _start_background_job(
         daemon=True,
     )
     thread.start()
-    return job_id
+    return reservation
+
+
+def _reserve_background_job(plugin_dir: str, job_name: str, delay_seconds: int) -> Dict[str, Any]:
+    job_id = str(uuid.uuid4())
+    status = "running" if delay_seconds == 0 else "waiting"
+    wait_text = (
+        "正在后台运行"
+        if delay_seconds == 0
+        else f"已排队，将在 {delay_seconds} 秒后运行"
+    )
+    job = _job_state_payload(
+        job_id,
+        job_name,
+        status,
+        f"{_job_display_name(job_name)}任务{wait_text}。任务 ID：{job_id}",
+    )
+    with JOB_STATE_LOCK:
+        active_job = _read_active_job_state_unlocked(plugin_dir)
+        if active_job:
+            message = (
+                f"当前已有{_job_display_name(active_job.get('job_name', ''))}"
+                f"任务正在执行，任务 ID：{active_job.get('job_id', '')}。"
+                "请等待完成后再启动新任务。"
+            )
+            return {
+                "status": "blocked",
+                "message": message,
+                "active_job": active_job,
+            }
+        _write_job_state_unlocked(plugin_dir, job)
+    return {"status": "queued", "job_id": job_id, "job": job}
+
+
+def _job_state_payload(
+    job_id: str,
+    job_name: str,
+    status: str,
+    message: str,
+) -> Dict[str, Any]:
+    now_label = _now_label()
+    return {
+        "status": status,
+        "message": message,
+        "job_id": job_id,
+        "job_name": job_name,
+        "job_label": _job_display_name(job_name),
+        "started_at": now_label,
+        "updated_at_ts": time.time(),
+    }
+
+
+def read_active_job_state(plugin_dir: str) -> Optional[Dict[str, Any]]:
+    with JOB_STATE_LOCK:
+        return _read_active_job_state_unlocked(plugin_dir)
+
+
+def _read_active_job_state_unlocked(plugin_dir: str) -> Optional[Dict[str, Any]]:
+    state = _read_job_state_unlocked(plugin_dir)
+    if not _is_active_job_state(state):
+        return None
+    return state
+
+
+def _is_active_job_state(state: Optional[Dict[str, Any]]) -> bool:
+    if not state or state.get("status") not in ("waiting", "running"):
+        return False
+    updated_at_ts = float(state.get("updated_at_ts") or 0)
+    return time.time() - updated_at_ts <= JOB_STATE_STALE_SECONDS
+
+
+def _job_state_path(plugin_dir: str) -> str:
+    return os.path.join(_exports_dir(plugin_dir), JOB_STATE_FILE)
+
+
+def _read_job_state_unlocked(plugin_dir: str) -> Optional[Dict[str, Any]]:
+    path = _job_state_path(plugin_dir)
+    if not os.path.isfile(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else None
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def _write_job_state(plugin_dir: str, state: Dict[str, Any]) -> None:
+    with JOB_STATE_LOCK:
+        _write_job_state_unlocked(plugin_dir, state)
+
+
+def _write_job_state_unlocked(plugin_dir: str, state: Dict[str, Any]) -> None:
+    current = _read_job_state_unlocked(plugin_dir)
+    payload = dict(state)
+    if current and current.get("job_id") == payload.get("job_id"):
+        payload["started_at"] = current.get("started_at") or payload.get("started_at")
+        payload.setdefault("job_label", current.get("job_label"))
+    payload["updated_at"] = _now_label()
+    payload["updated_at_ts"] = float(payload.get("updated_at_ts") or time.time())
+    _write_json_file_atomic(_job_state_path(plugin_dir), payload)
 
 
 def _job_display_name(job_name: str) -> str:
@@ -418,6 +520,8 @@ def run_channel_stream_regex_job(
         "channels_changed": 0,
         "streams_matched": 0,
         "streams_added": 0,
+        "links_removed": 0,
+        "links_reordered": 0,
         "streams_skipped": 0,
         "rules_skipped": 0,
         "errors": 0,
@@ -529,7 +633,11 @@ def run_channel_stream_regex_job(
             planned, skipped = _plan_replace(existing_links, deduped, settings)
             merge_skipped = []
         else:
-            planned, merge_skipped = _plan_merge_with_details(existing_links, deduped)
+            merge_existing_links, _merge_removed_links = _filter_channel_stream_links(
+                existing_links,
+                settings,
+            )
+            planned, merge_skipped = _plan_merge_with_details(merge_existing_links, deduped)
             skipped = len(merge_skipped)
 
         summary["streams_skipped"] += skipped
@@ -565,7 +673,7 @@ def run_channel_stream_regex_job(
                 f"  ... {len(merge_skipped) - 20} more merge-skipped streams"
             )
 
-        if dry_run or not planned and rule.mode != "replace":
+        if dry_run:
             if progress_callback:
                 progress_callback(
                     index,
@@ -585,6 +693,7 @@ def run_channel_stream_regex_job(
 
         try:
             with transaction.atomic():
+                channel_changed = False
                 if rule.mode == "replace":
                     if not planned and not _truthy(settings.get("allow_empty_replace")):
                         report_lines.append(
@@ -599,19 +708,48 @@ def run_channel_stream_regex_job(
                     ]
                     ChannelStream.objects.bulk_create(links, ignore_conflicts=True)
                     summary["streams_added"] += len(links)
+                    channel_changed = True
                 else:
-                    start_order = len(existing_links)
-                    links = [
-                        ChannelStream(
-                            channel=channel,
-                            stream=stream,
-                            order=start_order + index,
+                    ordered_streams, active_existing_links, removed_links = (
+                        _order_channel_streams_for_merge(existing_links, planned, settings)
+                    )
+                    existing_link_by_stream_identity = {
+                        id(link.stream): link
+                        for link in active_existing_links
+                        if getattr(link, "stream", None) is not None
+                    }
+                    changed_links = []
+                    links = []
+                    for stream_order, stream in enumerate(ordered_streams):
+                        existing_link = existing_link_by_stream_identity.get(id(stream))
+                        if existing_link is not None:
+                            if existing_link.order != stream_order:
+                                existing_link.order = stream_order
+                                changed_links.append(existing_link)
+                            continue
+                        links.append(
+                            ChannelStream(
+                                channel=channel,
+                                stream=stream,
+                                order=stream_order,
+                            )
                         )
-                        for index, stream in enumerate(planned)
-                    ]
-                    ChannelStream.objects.bulk_create(links, ignore_conflicts=True)
+                    if removed_links:
+                        ChannelStream.objects.filter(
+                            id__in=[link.id for link in removed_links]
+                        ).delete()
+                        channel_changed = True
+                    if changed_links:
+                        ChannelStream.objects.bulk_update(changed_links, ["order"])
+                        channel_changed = True
+                    if links:
+                        ChannelStream.objects.bulk_create(links, ignore_conflicts=True)
+                        channel_changed = True
                     summary["streams_added"] += len(links)
-                summary["channels_changed"] += 1
+                    summary["links_removed"] += len(removed_links)
+                    summary["links_reordered"] += len(changed_links)
+                if channel_changed:
+                    summary["channels_changed"] += 1
         except IntegrityError as exc:
             summary["errors"] += 1
             report_lines.append(f"  ! DB integrity error: {exc}")
@@ -631,6 +769,8 @@ def run_channel_stream_regex_job(
     summary["message"] = (
         f"{'预览' if dry_run else '执行'}完成：规则 {summary['rules_total']} 条，"
         f"匹配流 {summary['streams_matched']} 条，写入 {summary['streams_added']} 条，"
+        f"移除失效挂流 {summary['links_removed']} 条，"
+        f"更新顺序 {summary['links_reordered']} 条，"
         f"错误 {summary['errors']} 条。报告：{file_path}"
     )
     _write_last_result(plugin_dir, summary)
@@ -675,6 +815,7 @@ def sort_existing_channel_streams(
         "channels_seen": 0,
         "channels_changed": 0,
         "links_seen": 0,
+        "links_removed": 0,
         "links_reordered": 0,
         "rules_total": len(rules),
         "parse_errors": len(parse_errors),
@@ -709,22 +850,32 @@ def sort_existing_channel_streams(
             .order_by("order", "id")
         )
         summary["links_seen"] += len(links)
-        sorted_links = _sort_channel_stream_links(links, settings)
+        filtered_links, removed_links = _filter_channel_stream_links(links, settings)
+        sorted_links = _sort_channel_stream_links(filtered_links, settings)
         changed_links = []
         for new_order, link in enumerate(sorted_links):
             if link.order != new_order:
                 link.order = new_order
                 changed_links.append(link)
 
-        if changed_links:
+        if changed_links or removed_links:
             try:
                 with transaction.atomic():
+                    if removed_links:
+                        ChannelStream.objects.filter(id__in=[link.id for link in removed_links]).delete()
                     ChannelStream.objects.bulk_update(changed_links, ["order"])
                 summary["channels_changed"] += 1
+                summary["links_removed"] += len(removed_links)
                 summary["links_reordered"] += len(changed_links)
+                change_bits = []
+                if removed_links:
+                    change_bits.append(f"removed {len(removed_links)} stale links")
+                if changed_links:
+                    change_bits.append(
+                        f"reordered {len(changed_links)}/{len(sorted_links)} links"
+                    )
                 report_lines.append(
-                    f"[channel {channel.id}] reordered {len(changed_links)}/{len(links)} "
-                    f"links: {channel.name!r}"
+                    f"[channel {channel.id}] {', '.join(change_bits)}: {channel.name!r}"
                 )
                 for link in sorted_links[:50]:
                     stream = link.stream
@@ -755,6 +906,7 @@ def sort_existing_channel_streams(
     summary["message"] = (
         f"已挂流重排完成：处理频道 {summary['channels_seen']} 个，"
         f"调整频道 {summary['channels_changed']} 个，"
+        f"移除失效挂流 {summary['links_removed']} 条，"
         f"更新顺序 {summary['links_reordered']} 条，"
         f"错误 {summary['errors']} 条。报告：{file_path}"
     )
@@ -788,9 +940,10 @@ def _channels_for_existing_stream_sort(Channel, rules: Sequence[Rule]):
 
 
 def _sort_channel_stream_links(links: Sequence[Any], settings: Dict[str, Any]) -> List[Any]:
+    filtered_links, _removed_links = _filter_channel_stream_links(links, settings)
     stream_to_links: Dict[int, List[Any]] = {}
     stream_items = []
-    for link in links:
+    for link in filtered_links:
         stream = getattr(link, "stream", None)
         if stream is None:
             continue
@@ -802,6 +955,37 @@ def _sort_channel_stream_links(links: Sequence[Any], settings: Dict[str, Any]) -
     for stream in sorted_streams:
         sorted_links.extend(stream_to_links.get(id(stream), []))
     return sorted_links
+
+
+def _filter_channel_stream_links(links: Sequence[Any], settings: Dict[str, Any]) -> Tuple[List[Any], List[Any]]:
+    remove_stale = _truthy(settings.get("remove_stale_existing_streams", True))
+    filtered_links = []
+    removed_links = []
+    for link in links:
+        stream = getattr(link, "stream", None)
+        if stream is None:
+            continue
+        if remove_stale and _truthy(getattr(stream, "is_stale", False)):
+            removed_links.append(link)
+            continue
+        filtered_links.append(link)
+    return filtered_links, removed_links
+
+
+def _order_channel_streams_for_merge(
+    existing_links: Sequence[Any],
+    planned_streams: Sequence[Any],
+    settings: Dict[str, Any],
+) -> Tuple[List[Any], List[Any], List[Any]]:
+    active_existing_links, removed_links = _filter_channel_stream_links(existing_links, settings)
+    existing_streams = [
+        link.stream for link in active_existing_links if getattr(link, "stream", None) is not None
+    ]
+    ordered_streams = _sort_streams_for_assignment(
+        list(existing_streams) + list(planned_streams),
+        settings,
+    )
+    return ordered_streams, active_existing_links, removed_links
 
 
 def import_m3u_epg_sources(
@@ -1416,6 +1600,7 @@ def _sort_streams_for_assignment(streams: Iterable[Any], settings: Dict[str, Any
     source_rank_by_name = {
         source.casefold(): index for index, source in enumerate(source_priority)
     }
+
     def sort_key(item: Tuple[int, Any]):
         original_index, stream = item
         source_name = _stream_source_name(stream)
@@ -1666,10 +1851,12 @@ def _write_progress(
         "message": f"{message} {progress['bar']} {percent}%",
         "job_id": job_id,
         "job_name": job_name,
+        "job_label": _job_display_name(job_name),
         "progress": progress,
     }
     if extra:
         payload["summary"] = dict(extra)
+    _write_job_state(plugin_dir, payload)
     _write_last_result(plugin_dir, payload)
     return payload
 
@@ -1707,12 +1894,46 @@ def _progress_bar(percent: float) -> str:
 
 def _write_last_result(plugin_dir: str, result: Dict[str, Any]) -> None:
     path = os.path.join(_exports_dir(plugin_dir), LAST_RESULT_FILE)
-    tmp_path = f"{path}.tmp"
     payload = dict(result)
     payload["updated_at"] = _now_label()
+    _write_json_file_atomic(path, payload, lock=LAST_RESULT_WRITE_LOCK)
+
+
+def _write_json_file_atomic(
+    path: str,
+    payload: Dict[str, Any],
+    *,
+    lock: Optional[threading.Lock] = None,
+) -> None:
+    tmp_path = f"{path}.{uuid.uuid4().hex}.tmp"
     with open(tmp_path, "w", encoding="utf-8") as fh:
         json.dump(payload, fh, ensure_ascii=False, indent=2)
-    os.replace(tmp_path, path)
+    try:
+        write_lock = lock
+        if write_lock is None:
+            class _NoopLock:
+                def __enter__(self):
+                    return None
+
+                def __exit__(self, *_args):
+                    return False
+
+            write_lock = _NoopLock()
+        with write_lock:
+            for attempt in range(5):
+                try:
+                    os.replace(tmp_path, path)
+                    break
+                except PermissionError:
+                    if attempt >= 4:
+                        raise
+                    time.sleep(0.05 * (attempt + 1))
+    finally:
+        if os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except FileNotFoundError:
+                pass
 
 
 def read_latest_result(plugin_dir: str) -> Optional[Dict[str, Any]]:
