@@ -401,7 +401,12 @@ WARNING: Job {job_id} ({job_name}) has been running for over 30 minutes without 
 ### Phase 3：用户体验优化（推荐）
 - 增强错误消息（显示队列状态）
 - 查询结果中返回队列信息
-- 添加调试日志
+- **添加完整的调试日志（必须）**
+  - M3U 刷新事件接收日志
+  - 任务提交、拒绝、替换日志
+  - 任务启动、完成、失败日志
+  - 过期清理日志
+  - 队列轮转日志
 
 ### Phase 4：数据迁移（可选）
 - 从旧版本 `job_state.json` 导入活跃任务
@@ -433,6 +438,217 @@ WARNING: Job {job_id} ({job_name}) has been running for over 30 minutes without 
 
 ---
 
+## 日志增强
+
+### 当前问题
+
+用户反馈：M3U 刷新后任务没有执行，但看不到任何日志，不知道失败原因。
+
+**现有日志的不足：**
+1. **任务拦截无日志**：任务被阻塞时，没有记录为什么被拦截、是哪个任务在运行
+2. **事件接收无日志**：M3U 刷新事件到达时，没有记录事件内容和触发时间
+3. **任务提交无日志**：任务提交到队列时，没有记录队列状态
+4. **任务替换无日志**：旧任务被新任务替换时，没有明确的日志
+5. **过期清理无日志**：虽然有 WARNING 日志，但用户可能看不到 Docker 日志
+
+### 日志级别规范
+
+- **INFO**：正常流程关键节点（事件接收、任务提交、任务启动、任务完成）
+- **WARNING**：异常情况但可自动恢复（任务被拦截、任务被替换、任务过期清理）
+- **ERROR**：错误情况（任务执行失败、文件读写失败）
+
+### 新增日志点
+
+**1. M3U 刷新事件接收**
+
+```python
+logger.info(
+    "%s: M3U refresh event received, account=%s, payload=%s",
+    PLUGIN_KEY,
+    payload.get("account_name", "(all)"),
+    json.dumps(payload, ensure_ascii=False)
+)
+```
+
+**2. 任务提交到队列**
+
+```python
+# 成功提交
+logger.info(
+    "%s: Job submitted to queue, job_id=%s, job_name=%s, position=%s",
+    PLUGIN_KEY,
+    job_id,
+    job_name,
+    queue_position  # "running" or "pending"
+)
+
+# 任务被拒绝（队列已满）
+logger.warning(
+    "%s: Job rejected (queue full), job_name=%s, running=%s, pending=%s",
+    PLUGIN_KEY,
+    job_name,
+    running_job_name,
+    pending_job_name
+)
+```
+
+**3. 任务替换**
+
+```python
+logger.warning(
+    "%s: Pending job replaced, old_job_id=%s, old_job_name=%s, new_job_id=%s, new_job_name=%s",
+    PLUGIN_KEY,
+    old_job_id,
+    old_job_name,
+    new_job_id,
+    new_job_name
+)
+```
+
+**4. 任务过期清理**
+
+```python
+# Running 任务过期
+logger.warning(
+    "%s: Stale running job detected and removed, job_id=%s, job_name=%s, last_update=%s, stale_seconds=%d",
+    PLUGIN_KEY,
+    job_id,
+    job_name,
+    last_update_time,
+    int(time.time() - updated_at_ts)
+)
+
+# Pending 任务过期
+logger.warning(
+    "%s: Stale pending job detected and removed, job_id=%s, job_name=%s, queued_at=%s, wait_seconds=%d",
+    PLUGIN_KEY,
+    job_id,
+    job_name,
+    queued_at,
+    int(time.time() - queued_at_ts)
+)
+```
+
+**5. 队列轮转**
+
+```python
+logger.info(
+    "%s: Queue rotation triggered, completed_job_id=%s, next_job_id=%s, next_job_name=%s",
+    PLUGIN_KEY,
+    completed_job_id,
+    next_job_id,
+    next_job_name
+)
+
+# 队列变为空闲
+logger.info(
+    "%s: Queue is now idle, completed_job_id=%s",
+    PLUGIN_KEY,
+    completed_job_id
+)
+```
+
+**6. 任务启动**
+
+```python
+# 立即启动
+logger.info(
+    "%s: Job started immediately, job_id=%s, job_name=%s",
+    PLUGIN_KEY,
+    job_id,
+    job_name
+)
+
+# 延迟启动
+logger.info(
+    "%s: Job will start after delay, job_id=%s, job_name=%s, delay_seconds=%d",
+    PLUGIN_KEY,
+    job_id,
+    job_name,
+    delay_seconds
+)
+```
+
+**7. 任务完成**
+
+```python
+# 成功完成
+logger.info(
+    "%s: Job completed successfully, job_id=%s, job_name=%s, duration_seconds=%.1f, summary=%s",
+    PLUGIN_KEY,
+    job_id,
+    job_name,
+    duration_seconds,
+    json.dumps(summary, ensure_ascii=False)
+)
+
+# 失败
+logger.error(
+    "%s: Job failed, job_id=%s, job_name=%s, error=%s",
+    PLUGIN_KEY,
+    job_id,
+    job_name,
+    str(exc)
+)
+```
+
+**8. 文件操作错误**
+
+```python
+# 队列文件读取失败
+logger.error(
+    "%s: Failed to read job queue file, path=%s, error=%s, fallback=empty_queue",
+    PLUGIN_KEY,
+    queue_file_path,
+    str(exc)
+)
+
+# 队列文件写入失败
+logger.error(
+    "%s: Failed to write job queue file, path=%s, error=%s",
+    PLUGIN_KEY,
+    queue_file_path,
+    str(exc)
+)
+```
+
+### 日志查询建议
+
+**查看最近的任务提交和执行：**
+```bash
+docker logs dispatcharr 2>&1 | grep "channel_stream_regex_assigner" | tail -50
+```
+
+**查看 M3U 刷新事件：**
+```bash
+docker logs dispatcharr 2>&1 | grep "M3U refresh event received"
+```
+
+**查看任务被拒绝的原因：**
+```bash
+docker logs dispatcharr 2>&1 | grep "Job rejected"
+```
+
+**查看任务替换情况：**
+```bash
+docker logs dispatcharr 2>&1 | grep "Pending job replaced"
+```
+
+**查看过期任务清理：**
+```bash
+docker logs dispatcharr 2>&1 | grep "Stale.*job detected"
+```
+
+### 结构化日志上下文
+
+每条关键日志都包含：
+- **插件标识**：`PLUGIN_KEY` 前缀，方便过滤
+- **任务标识**：`job_id` 和 `job_name`，方便追踪
+- **时间信息**：自动由 logger 添加时间戳
+- **上下文信息**：队列状态、替换原因、错误详情等
+
+---
+
 ## 未来扩展可能
 
 1. **优先级队列**：为不同任务类型设置优先级，高优先级任务可以插队
@@ -440,6 +656,7 @@ WARNING: Job {job_id} ({job_name}) has been running for over 30 minutes without 
 3. **任务取消**：用户手动取消队列中的 `pending` 任务
 4. **任务重试**：失败任务自动重试（带指数退避）
 5. **任务历史**：保留最近 N 个任务的执行记录
+6. **日志导出**：插件内保存最近的日志到文件（方便非 Docker 用户查看）
 
 ---
 
@@ -452,3 +669,4 @@ WARNING: Job {job_id} ({job_name}) has been running for over 30 minutes without 
 - ✅ 任务不会永久阻塞（自动清理过期任务）
 - ✅ 用户能看到队列状态（调试友好）
 - ✅ 代码改动可控（基于现有架构增强）
+- ✅ 完善的日志记录（事件接收、任务提交、替换、清理、完成全流程可追踪）
