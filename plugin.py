@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 import re
 import gzip
@@ -8,20 +9,32 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 
 PLUGIN_KEY = "channel_stream_regex_assigner"
+# 模块级日志器：target 函数（后台线程内）拿不到 context logger，统一用这里记录，
+# 与 Dispatcharr 的 logging 配置走同一出口，Docker 日志可见。
+LOGGER = logging.getLogger(PLUGIN_KEY)
 EXPORT_DIR = "exports"
 PLUGIN_DATA_DIR = "plugin_data"
 LAST_RESULT_FILE = "last_result.json"
 JOB_STATE_FILE = "job_state.json"
+DAILY_SCHEDULER_STATE_FILE = "daily_scheduler_state.json"
 RULES_FILE_NAME = "channel_rules.txt"
 LEGACY_RULES_TEMPLATE_FILENAME = "channel_rules_template.txt"
 RULE_DELIMITERS = ("|||", "\t")
 PROGRESS_LOG_INTERVAL_SECONDS = 5
 JOB_STATE_STALE_SECONDS = 6 * 60 * 60
+AUTO_M3U_REFRESH_JOB_NAME = "auto_m3u_refresh"
+SCHEDULED_MATCH_JOB_NAME = "scheduled_match"
+DAILY_SCHEDULER_JOB_NAME = "daily_scheduler"
+DAILY_SCHEDULER_DEFAULT_TIME = "04:30"
+DAILY_SCHEDULER_POLL_SECONDS = 60
+AUTO_REFRESH_PENDING_KEY = "pending_auto_refresh"
+AUTO_REFRESH_PENDING_COUNT_KEY = "pending_auto_refresh_count"
+AUTO_REFRESH_PENDING_AT_KEY = "pending_auto_refresh_at"
 EPG_URL_ATTR_RE = re.compile(
     r"(?:x-tvg-url|url-tvg|tvg-url)\s*=\s*([\"'])(.*?)\1",
     re.IGNORECASE,
@@ -32,6 +45,14 @@ EPG_URL_FALLBACK_RE = re.compile(
 )
 LAST_RESULT_WRITE_LOCK = threading.Lock()
 JOB_STATE_LOCK = threading.Lock()
+DAILY_SCHEDULER_LOCK = threading.Lock()
+DAILY_SCHEDULERS: Dict[str, Dict[str, Any]] = {}
+JOB_CANCEL_LOCK = threading.Lock()
+JOB_CANCEL_EVENTS: Dict[str, threading.Event] = {}
+
+
+class JobCancelled(Exception):
+    """Raised inside background jobs when the user requests a cooperative stop."""
 
 
 @dataclass
@@ -46,8 +67,8 @@ class Rule:
 
 class Plugin:
     name = "Channel Stream Regex Assigner"
-    version = "0.3.1"
-    description = "Use regex rules to attach Streams to Channels and import EPG URLs from M3U headers."
+    version = "0.3.7"
+    description = "按正则规则把 Streams 自动挂到 Channels，支持跟随 M3U 刷新自动执行、每日定时执行，并从 M3U 头部自动导入 EPG。"
     author = "Fengbao"
 
     fields = []
@@ -66,6 +87,9 @@ class Plugin:
         settings = context.get("settings", {})
         logger = context.get("logger")
         plugin_dir = _plugin_dir()
+        # 入口触发日志：自动事件触发和手动按钮触发都记录一行，方便排查
+        # m3u_refresh 是否真的派发到本插件。latest_result 是纯状态查询，跳过避免刷屏。
+        _log_run_trigger(logger, action, params, settings)
 
         if action in ("generate_rules", "generate_template"):
             result = generate_channel_rules_file(settings, plugin_dir, overwrite=True)
@@ -140,8 +164,37 @@ class Plugin:
             )
             return _format_background_job_result(result, "M3U 头部 EPG 扫描任务已提交")
 
+        if action == "start_daily_scheduler":
+            result = start_daily_scheduler(settings, plugin_dir, logger=logger)
+            if logger:
+                logger.info("%s daily scheduler start result: %s", self.name, result)
+            return result
+
+        if action == "stop_daily_scheduler":
+            result = stop_daily_scheduler(plugin_dir, logger=logger)
+            if logger:
+                logger.info("%s daily scheduler stop result: %s", self.name, result)
+            return result
+
+        if action == "stop_all_tasks":
+            result = stop_all_tasks(plugin_dir, logger=logger)
+            if logger:
+                logger.info("%s stop all tasks result: %s", self.name, result)
+            return result
+
         if action == "auto_m3u_refresh":
             if not _truthy(settings.get("auto_on_m3u_refresh")):
+                skipped = {
+                    "status": "skipped",
+                    "message": "M3U 刷新后自动执行未启用，已跳过。",
+                    "job_name": AUTO_M3U_REFRESH_JOB_NAME,
+                }
+                _write_last_result(plugin_dir, skipped)
+                if logger:
+                    logger.info(
+                        "%s auto refresh skipped because setting is disabled",
+                        PLUGIN_KEY,
+                    )
                 return {
                     "status": "skipped",
                     "message": "M3U 刷新后自动执行未启用，已跳过。",
@@ -151,7 +204,7 @@ class Plugin:
             )
             payload = params.get("payload", {}) if isinstance(params, dict) else {}
             result = _start_background_job(
-                "auto_m3u_refresh",
+                AUTO_M3U_REFRESH_JOB_NAME,
                 plugin_dir,
                 handle_m3u_refresh_job,
                 logger=logger,
@@ -160,6 +213,8 @@ class Plugin:
                 plugin_dir=plugin_dir,
                 payload=payload,
             )
+            if logger:
+                logger.info("%s background job result: %s", self.name, result)
             return _format_background_job_result(
                 result,
                 f"M3U 刷新成功事件已接收，将在 {delay_minutes} 分钟后扫描 EPG 并执行匹配",
@@ -194,12 +249,45 @@ class Plugin:
         return {"status": "error", "message": f"Unknown action: {action}"}
 
 
+def _log_run_trigger(logger, action: str, params: Any, settings: Dict[str, Any]) -> None:
+    """记录每次 run() 调用，便于排查自动/手动触发是否真的到达本插件。
+
+    自动事件触发时 Dispatcharr 会传入 params={"event": "...", "payload": {...}}；
+    手动点按钮触发时 params 一般为空。据此区分来源并写入一行 INFO 日志。
+    """
+    if not logger or action == "latest_result":
+        return
+    raw_params = params if isinstance(params, dict) else {}
+    payload = raw_params.get("payload") if isinstance(raw_params.get("payload"), dict) else {}
+    event_name = raw_params.get("event")
+    if event_name:
+        source = f"自动触发(事件={event_name})"
+    else:
+        source = "手动触发(UI按钮)"
+    logger.info(
+        "%s run() 被调用: action=%s 来源=%s auto_on_m3u_refresh=%s 触发账号=%r",
+        PLUGIN_KEY,
+        action,
+        source,
+        _truthy(settings.get("auto_on_m3u_refresh")),
+        payload.get("account_name"),
+    )
+
+
 def _format_background_job_result(result: Dict[str, Any], queued_prefix: str) -> Dict[str, Any]:
     if result.get("status") == "blocked":
         return {
             "status": "blocked",
             "message": result.get("message", "已有后台任务正在执行，请稍后再试。"),
             "active_job": result.get("active_job"),
+        }
+    if result.get("status") == "coalesced":
+        return {
+            "status": "queued",
+            "message": result.get("message", "自动任务已合并到当前队列中。"),
+            "task_id": result.get("job_id"),
+            "active_job": result.get("job"),
+            "merged": True,
         }
     job_id = result.get("job_id", "")
     return {
@@ -223,9 +311,35 @@ def _start_background_job(
     delay_seconds = max(int(delay_seconds or 0), 0)
     reservation = _reserve_background_job(result_dir, job_name, delay_seconds)
     if reservation.get("status") == "blocked":
+        blocked_state = {
+            "status": "blocked",
+            "message": reservation.get("message", "已有后台任务正在执行，请稍后再试。"),
+            "job_name": job_name,
+            "blocked_by": reservation.get("active_job"),
+            "active_job": reservation.get("active_job"),
+            "updated_at": _now_label(),
+        }
+        _write_last_result(result_dir, blocked_state)
+        if logger:
+            logger.warning(
+                "%s job %s blocked by active job %s",
+                PLUGIN_KEY,
+                job_name,
+                (reservation.get("active_job") or {}).get("job_id", ""),
+            )
         return reservation
     job_id = reservation["job_id"]
     _write_last_result(result_dir, reservation["job"])
+
+    if reservation.get("status") == "coalesced":
+        if logger:
+            logger.info(
+                "%s job %s coalesced into active job %s",
+                PLUGIN_KEY,
+                job_name,
+                job_id,
+            )
+        return reservation
 
     def runner():
         try:
@@ -236,7 +350,14 @@ def _start_background_job(
             pass
 
         if delay_seconds > 0:
-            time.sleep(delay_seconds)
+            LOGGER.info(
+                "%s 任务 %s 已排队，等待 %s 秒后执行，job_id=%s",
+                PLUGIN_KEY, job_name, delay_seconds, job_id,
+            )
+            delay_deadline = time.monotonic() + delay_seconds
+            while time.monotonic() < delay_deadline:
+                _raise_if_job_cancelled(job_name, job_id)
+                time.sleep(min(delay_deadline - time.monotonic(), 1))
             running_state = _job_state_payload(
                 job_id,
                 job_name,
@@ -248,8 +369,11 @@ def _start_background_job(
 
         try:
             progress_log_state = {"last_at": 0.0, "last_message": ""}
+            rerun_count = 0
+            current_payload = dict(job_kwargs)
 
             def progress_callback(current, total, message, extra=None):
+                _raise_if_job_cancelled(job_name, job_id)
                 payload = _write_progress(
                     result_dir,
                     job_id,
@@ -260,14 +384,66 @@ def _start_background_job(
                     extra=extra,
                 )
                 _log_progress(logger, payload, progress_log_state)
+                _raise_if_job_cancelled(job_name, job_id)
 
-            result = target(progress_callback=progress_callback, **job_kwargs)
-            if isinstance(result, dict):
+            while True:
+                _raise_if_job_cancelled(job_name, job_id)
+                LOGGER.info(
+                    "%s 任务 %s 开始执行，job_id=%s",
+                    PLUGIN_KEY, job_name, job_id,
+                )
+                result = target(progress_callback=progress_callback, **current_payload)
+                _raise_if_job_cancelled(job_name, job_id)
+                if not isinstance(result, dict):
+                    result = {
+                        "status": "ok",
+                        "message": (
+                            f"{_job_display_name(job_name)}任务完成。"
+                            f"任务 ID：{job_id}"
+                        ),
+                    }
+
+                if job_name == AUTO_M3U_REFRESH_JOB_NAME:
+                    pending_count = _consume_pending_auto_refresh_count(
+                        result_dir, job_id
+                    )
+                    if pending_count > 0:
+                        rerun_count += pending_count
+                        rerun_state = _job_state_payload(
+                            job_id,
+                            job_name,
+                            "running",
+                            (
+                                f"{_job_display_name(job_name)}任务已合并 "
+                                f"{pending_count} 个新的 M3U 刷新事件，"
+                                "正在自动补跑。"
+                                f"任务 ID：{job_id}"
+                            ),
+                        )
+                        _write_job_state(result_dir, rerun_state)
+                        _write_last_result(result_dir, rerun_state)
+                        if logger:
+                            logger.info(
+                                "%s job %s will rerun after merging %s pending events",
+                                PLUGIN_KEY,
+                                job_id,
+                                pending_count,
+                            )
+                        current_payload = dict(job_kwargs)
+                        current_payload["payload"] = {}
+                        continue
+
                 completed = dict(result)
                 completed["job_id"] = job_id
                 completed["job_name"] = job_name
                 completed["finished_at"] = _now_label()
                 completed["status"] = completed.get("status") or "ok"
+                if rerun_count > 0:
+                    completed["message"] = (
+                        f"{completed.get('message', 'done')} "
+                        f"已自动补跑 {rerun_count} 个额外刷新事件。"
+                    )
+                    completed["rerun_count"] = rerun_count
                 _write_job_state(result_dir, completed)
                 _write_last_result(result_dir, completed)
                 if logger:
@@ -277,26 +453,22 @@ def _start_background_job(
                         job_id,
                         completed.get("message", "done"),
                     )
-            else:
-                completed = {
-                    "status": "ok",
-                    "message": (
-                        f"{_job_display_name(job_name)}任务完成。"
-                        f"任务 ID：{job_id}"
-                    ),
-                    "job_id": job_id,
-                    "job_name": job_name,
-                    "finished_at": _now_label(),
-                }
-                _write_job_state(result_dir, completed)
-                _write_last_result(result_dir, completed)
-                if logger:
-                    logger.info(
-                        "%s job %s completed: %s",
-                        PLUGIN_KEY,
-                        job_id,
-                        completed["message"],
-                    )
+                break
+        except JobCancelled as exc:
+            if logger:
+                logger.warning("%s background job %s canceled", PLUGIN_KEY, job_id)
+            canceled = {
+                "status": "canceled",
+                "message": str(exc) or (
+                    f"{_job_display_name(job_name)}任务已被手动停止。"
+                    f"任务 ID：{job_id}"
+                ),
+                "job_id": job_id,
+                "job_name": job_name,
+                "finished_at": _now_label(),
+            }
+            _write_job_state(result_dir, canceled)
+            _write_last_result(result_dir, canceled)
         except Exception as exc:
             if logger:
                 logger.exception("%s background job %s failed", PLUGIN_KEY, job_id)
@@ -314,6 +486,7 @@ def _start_background_job(
                 if logger:
                     logger.exception("%s failed to write error report", PLUGIN_KEY)
         finally:
+            _unregister_job_cancel_event(job_id)
             try:
                 from django.db import close_old_connections
 
@@ -326,6 +499,7 @@ def _start_background_job(
         name=f"{PLUGIN_KEY}-{job_name}-{job_id[:8]}",
         daemon=True,
     )
+    _register_job_cancel_event(job_id)
     thread.start()
     return reservation
 
@@ -347,6 +521,21 @@ def _reserve_background_job(plugin_dir: str, job_name: str, delay_seconds: int) 
     with JOB_STATE_LOCK:
         active_job = _read_active_job_state_unlocked(plugin_dir)
         if active_job:
+            if (
+                job_name == AUTO_M3U_REFRESH_JOB_NAME
+                and active_job.get("job_name") == AUTO_M3U_REFRESH_JOB_NAME
+            ):
+                pending_job = _mark_pending_auto_refresh_unlocked(plugin_dir, active_job)
+                return {
+                    "status": "coalesced",
+                    "message": (
+                        "M3U 刷新事件已合并到当前自动任务，"
+                        f"任务 ID：{active_job.get('job_id', '')}。"
+                    ),
+                    "job_id": active_job.get("job_id", ""),
+                    "job": pending_job,
+                    "active_job": pending_job,
+                }
             message = (
                 f"当前已有{_job_display_name(active_job.get('job_name', ''))}"
                 f"任务正在执行，任务 ID：{active_job.get('job_id', '')}。"
@@ -375,6 +564,7 @@ def _job_state_payload(
         "job_name": job_name,
         "job_label": _job_display_name(job_name),
         "started_at": now_label,
+        "runner_pid": os.getpid(),
         "updated_at_ts": time.time(),
     }
 
@@ -391,8 +581,55 @@ def _read_active_job_state_unlocked(plugin_dir: str) -> Optional[Dict[str, Any]]
     return state
 
 
+def _mark_pending_auto_refresh_unlocked(
+    plugin_dir: str,
+    active_job: Dict[str, Any],
+) -> Dict[str, Any]:
+    current = _read_job_state_unlocked(plugin_dir) or dict(active_job)
+    if current.get("job_id") != active_job.get("job_id"):
+        current = dict(active_job)
+    pending_count = int(current.get(AUTO_REFRESH_PENDING_COUNT_KEY) or 0) + 1
+    current[AUTO_REFRESH_PENDING_KEY] = True
+    current[AUTO_REFRESH_PENDING_COUNT_KEY] = pending_count
+    current[AUTO_REFRESH_PENDING_AT_KEY] = _now_label()
+    current["message"] = (
+        f"{_job_display_name(AUTO_M3U_REFRESH_JOB_NAME)}任务正在执行，"
+        f"已合并 {pending_count} 个新的 M3U 刷新事件，"
+        "当前任务完成后会自动补跑。"
+        f"任务 ID：{current.get('job_id', '')}"
+    )
+    _write_job_state_unlocked(plugin_dir, current)
+    return current
+
+
+def _consume_pending_auto_refresh_count(
+    plugin_dir: str,
+    job_id: str,
+) -> int:
+    with JOB_STATE_LOCK:
+        state = _read_job_state_unlocked(plugin_dir)
+        if not state or state.get("job_id") != job_id:
+            return 0
+        pending_count = int(state.get(AUTO_REFRESH_PENDING_COUNT_KEY) or 0)
+        if pending_count <= 0:
+            return 0
+        state[AUTO_REFRESH_PENDING_KEY] = False
+        state[AUTO_REFRESH_PENDING_COUNT_KEY] = 0
+        state[AUTO_REFRESH_PENDING_AT_KEY] = None
+        _write_job_state_unlocked(plugin_dir, state)
+        return pending_count
+
+
 def _is_active_job_state(state: Optional[Dict[str, Any]]) -> bool:
     if not state or state.get("status") not in ("waiting", "running"):
+        return False
+    runner_pid = state.get("runner_pid")
+    if runner_pid is None:
+        return False
+    try:
+        if int(runner_pid) != os.getpid():
+            return False
+    except (TypeError, ValueError):
         return False
     updated_at_ts = float(state.get("updated_at_ts") or 0)
     return time.time() - updated_at_ts <= JOB_STATE_STALE_SECONDS
@@ -425,6 +662,15 @@ def _write_job_state_unlocked(plugin_dir: str, state: Dict[str, Any]) -> None:
     if current and current.get("job_id") == payload.get("job_id"):
         payload["started_at"] = current.get("started_at") or payload.get("started_at")
         payload.setdefault("job_label", current.get("job_label"))
+        for key in (
+            AUTO_REFRESH_PENDING_KEY,
+            AUTO_REFRESH_PENDING_COUNT_KEY,
+            AUTO_REFRESH_PENDING_AT_KEY,
+        ):
+            if key in current and key not in payload:
+                payload[key] = current[key]
+    if payload.get("status") in ("waiting", "running"):
+        payload["runner_pid"] = int(payload.get("runner_pid") or os.getpid())
     payload["updated_at"] = _now_label()
     payload["updated_at_ts"] = float(payload.get("updated_at_ts") or time.time())
     _write_json_file_atomic(_job_state_path(plugin_dir), payload)
@@ -436,9 +682,317 @@ def _job_display_name(job_name: str) -> str:
         "apply_match": "立即执行规则匹配",
         "sort_existing_streams": "重排已挂流",
         "scan_m3u_epg": "扫描 M3U EPG",
-        "auto_m3u_refresh": "M3U 刷新后自动执行",
+        AUTO_M3U_REFRESH_JOB_NAME: "M3U 刷新后自动执行",
+        SCHEDULED_MATCH_JOB_NAME: "每日定时规则匹配",
+        DAILY_SCHEDULER_JOB_NAME: "每日定时器",
     }
     return names.get(job_name, job_name)
+
+
+def start_daily_scheduler(
+    settings: Dict[str, Any],
+    plugin_dir: str,
+    *,
+    logger=None,
+) -> Dict[str, Any]:
+    daily_time = str(
+        settings.get("daily_schedule_time") or DAILY_SCHEDULER_DEFAULT_TIME
+    ).strip()
+    if not _truthy(settings.get("daily_schedule_enabled")):
+        _stop_daily_scheduler_entry(plugin_dir)
+        result = {
+            "status": "skipped",
+            "message": "每日定时执行未启用，定时器未启动。",
+            "job_name": DAILY_SCHEDULER_JOB_NAME,
+        }
+        _write_daily_scheduler_state(plugin_dir, result)
+        _write_last_result(plugin_dir, result)
+        return result
+
+    try:
+        _parse_daily_schedule_time(daily_time)
+    except ValueError as exc:
+        result = {
+            "status": "error",
+            "message": f"每日执行时间无效：{exc}",
+            "job_name": DAILY_SCHEDULER_JOB_NAME,
+            "daily_schedule_time": daily_time,
+        }
+        _write_daily_scheduler_state(plugin_dir, result)
+        _write_last_result(plugin_dir, result)
+        return result
+
+    _stop_daily_scheduler_entry(plugin_dir)
+    now = datetime.now()
+    next_run = _next_daily_run_datetime(now, daily_time)
+    stop_event = threading.Event()
+    scheduler_settings = dict(settings)
+    thread = threading.Thread(
+        target=_daily_scheduler_loop,
+        name=f"{PLUGIN_KEY}-daily-scheduler",
+        daemon=True,
+        kwargs={
+            "settings": scheduler_settings,
+            "plugin_dir": plugin_dir,
+            "daily_time": daily_time,
+            "stop_event": stop_event,
+            "logger": logger,
+        },
+    )
+    with DAILY_SCHEDULER_LOCK:
+        DAILY_SCHEDULERS[_daily_scheduler_key(plugin_dir)] = {
+            "thread": thread,
+            "stop_event": stop_event,
+            "daily_time": daily_time,
+        }
+    thread.start()
+
+    result = {
+        "status": "ok",
+        "message": f"每日定时器已启动：每天 {daily_time} 执行规则匹配。",
+        "job_name": DAILY_SCHEDULER_JOB_NAME,
+        "daily_schedule_time": daily_time,
+        "next_run_at": _format_datetime(next_run),
+    }
+    _write_daily_scheduler_state(plugin_dir, result)
+    _write_last_result(plugin_dir, result)
+    return result
+
+
+def stop_daily_scheduler(plugin_dir: str, *, logger=None) -> Dict[str, Any]:
+    stopped = _stop_daily_scheduler_entry(plugin_dir)
+    result = {
+        "status": "stopped",
+        "message": "每日定时器已停止。" if stopped else "每日定时器未运行。",
+        "job_name": DAILY_SCHEDULER_JOB_NAME,
+    }
+    _write_daily_scheduler_state(plugin_dir, result)
+    _write_last_result(plugin_dir, result)
+    if logger and stopped:
+        logger.info("%s daily scheduler stopped", PLUGIN_KEY)
+    return result
+
+
+def stop_all_tasks(plugin_dir: str, *, logger=None) -> Dict[str, Any]:
+    scheduler_stopped = _stop_daily_scheduler_entry(plugin_dir)
+    cancelled_job_ids = _request_all_job_cancellation()
+    canceled_active_job = _cancel_active_job_state(plugin_dir)
+    message_parts = ["已请求停止全部后台任务。"]
+    if scheduler_stopped:
+        message_parts.append("每日定时器已停止。")
+    if canceled_active_job:
+        message_parts.append(
+            f"当前{_job_display_name(canceled_active_job.get('job_name', ''))}"
+            f"任务已标记取消，任务 ID：{canceled_active_job.get('job_id', '')}。"
+        )
+    elif not cancelled_job_ids:
+        message_parts.append("当前没有发现正在运行的后台任务。")
+    result = {
+        "status": "ok",
+        "message": "".join(message_parts),
+        "job_name": "stop_all_tasks",
+        "scheduler_stopped": scheduler_stopped,
+        "cancelled_job_ids": cancelled_job_ids,
+        "canceled_active_job": canceled_active_job,
+    }
+    if scheduler_stopped:
+        _write_daily_scheduler_state(
+            plugin_dir,
+            {
+                "status": "stopped",
+                "message": "停止全部任务时已停止每日定时器。",
+                "job_name": DAILY_SCHEDULER_JOB_NAME,
+            },
+        )
+    _write_last_result(plugin_dir, result)
+    if logger:
+        logger.warning("%s stop all tasks requested: %s", PLUGIN_KEY, result)
+    return result
+
+
+def read_daily_scheduler_state(plugin_dir: str) -> Optional[Dict[str, Any]]:
+    path = _daily_scheduler_state_path(plugin_dir)
+    if not os.path.isfile(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else None
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def _daily_scheduler_loop(
+    *,
+    settings: Dict[str, Any],
+    plugin_dir: str,
+    daily_time: str,
+    stop_event: threading.Event,
+    logger=None,
+) -> None:
+    while not stop_event.is_set():
+        now = datetime.now()
+        next_run = _next_daily_run_datetime(now, daily_time)
+        _write_daily_scheduler_state(
+            plugin_dir,
+            {
+                "status": "waiting",
+                "message": f"每日定时器等待中：下次 {daily_time} 执行。",
+                "job_name": DAILY_SCHEDULER_JOB_NAME,
+                "daily_schedule_time": daily_time,
+                "next_run_at": _format_datetime(next_run),
+            },
+        )
+        wait_seconds = max((next_run - now).total_seconds(), 0)
+        while wait_seconds > 0 and not stop_event.is_set():
+            if stop_event.wait(min(wait_seconds, DAILY_SCHEDULER_POLL_SECONDS)):
+                return
+            wait_seconds = max((next_run - datetime.now()).total_seconds(), 0)
+        if stop_event.is_set():
+            return
+
+        result = _start_background_job(
+            SCHEDULED_MATCH_JOB_NAME,
+            plugin_dir,
+            run_channel_stream_regex_job,
+            logger=logger,
+            settings=settings,
+            plugin_dir=plugin_dir,
+            dry_run=False,
+        )
+        scheduler_state = {
+            "status": "triggered" if result.get("status") != "blocked" else "blocked",
+            "message": (
+                f"每日定时器已触发规则匹配，任务 ID：{result.get('job_id', '')}。"
+                if result.get("status") != "blocked"
+                else result.get("message", "每日定时执行被已有任务阻塞。")
+            ),
+            "job_name": DAILY_SCHEDULER_JOB_NAME,
+            "daily_schedule_time": daily_time,
+            "last_run_at": _now_label(),
+            "result": result,
+        }
+        _write_daily_scheduler_state(plugin_dir, scheduler_state)
+        if logger:
+            logger.info("%s daily scheduler trigger result: %s", PLUGIN_KEY, result)
+
+
+def _stop_daily_scheduler_entry(plugin_dir: str) -> bool:
+    with DAILY_SCHEDULER_LOCK:
+        entry = DAILY_SCHEDULERS.pop(_daily_scheduler_key(plugin_dir), None)
+    if not entry:
+        return False
+    stop_event = entry.get("stop_event")
+    thread = entry.get("thread")
+    if stop_event:
+        stop_event.set()
+    if thread and thread.is_alive():
+        thread.join(timeout=1)
+    return True
+
+
+def _stop_all_daily_schedulers_for_tests() -> None:
+    with DAILY_SCHEDULER_LOCK:
+        entries = list(DAILY_SCHEDULERS.values())
+        DAILY_SCHEDULERS.clear()
+    for entry in entries:
+        stop_event = entry.get("stop_event")
+        thread = entry.get("thread")
+        if stop_event:
+            stop_event.set()
+        if thread and thread.is_alive():
+            thread.join(timeout=1)
+
+
+def _register_job_cancel_event(job_id: str) -> threading.Event:
+    with JOB_CANCEL_LOCK:
+        event = threading.Event()
+        JOB_CANCEL_EVENTS[job_id] = event
+        return event
+
+
+def _unregister_job_cancel_event(job_id: str) -> None:
+    with JOB_CANCEL_LOCK:
+        JOB_CANCEL_EVENTS.pop(job_id, None)
+
+
+def _request_all_job_cancellation() -> List[str]:
+    with JOB_CANCEL_LOCK:
+        items = list(JOB_CANCEL_EVENTS.items())
+    for _job_id, event in items:
+        event.set()
+    return [job_id for job_id, _event in items]
+
+
+def _is_job_cancelled(job_id: str = "") -> bool:
+    with JOB_CANCEL_LOCK:
+        if job_id:
+            event = JOB_CANCEL_EVENTS.get(job_id)
+            if event and event.is_set():
+                return True
+        return any(event.is_set() for event in JOB_CANCEL_EVENTS.values())
+
+
+def _raise_if_job_cancelled(job_name: str = "", job_id: str = "") -> None:
+    if _is_job_cancelled(job_id):
+        raise JobCancelled(
+            f"{_job_display_name(job_name)}任务已收到停止请求。任务 ID：{job_id}"
+        )
+
+
+def _cancel_active_job_state(plugin_dir: str) -> Optional[Dict[str, Any]]:
+    with JOB_STATE_LOCK:
+        active_job = _read_job_state_unlocked(plugin_dir)
+        if not active_job or active_job.get("status") not in ("waiting", "running"):
+            return None
+        canceled = dict(active_job)
+        canceled["status"] = "canceled"
+        canceled["message"] = (
+            f"{_job_display_name(canceled.get('job_name', ''))}任务已被手动停止。"
+            f"任务 ID：{canceled.get('job_id', '')}"
+        )
+        canceled["finished_at"] = _now_label()
+        _write_job_state_unlocked(plugin_dir, canceled)
+    _write_last_result(plugin_dir, canceled)
+    return canceled
+
+
+def _parse_daily_schedule_time(value: Any) -> Tuple[int, int]:
+    text = str(value or "").strip()
+    match = re.fullmatch(r"(\d{1,2}):(\d{2})", text)
+    if not match:
+        raise ValueError("请使用 HH:MM 格式，例如 04:30。")
+    hour = int(match.group(1))
+    minute = int(match.group(2))
+    if hour > 23 or minute > 59:
+        raise ValueError("小时必须为 0-23，分钟必须为 0-59。")
+    return hour, minute
+
+
+def _next_daily_run_datetime(now: datetime, daily_time: Any) -> datetime:
+    hour, minute = _parse_daily_schedule_time(daily_time)
+    next_run = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if next_run <= now:
+        next_run = next_run + timedelta(days=1)
+    return next_run
+
+
+def _daily_scheduler_key(plugin_dir: str) -> str:
+    return os.path.abspath(plugin_dir)
+
+
+def _daily_scheduler_state_path(plugin_dir: str) -> str:
+    return os.path.join(_exports_dir(plugin_dir), DAILY_SCHEDULER_STATE_FILE)
+
+
+def _write_daily_scheduler_state(plugin_dir: str, state: Dict[str, Any]) -> None:
+    payload = dict(state)
+    payload["updated_at"] = _now_label()
+    _write_json_file_atomic(_daily_scheduler_state_path(plugin_dir), payload)
+
+
+def _format_datetime(value: datetime) -> str:
+    return value.strftime("%Y-%m-%d %H:%M:%S")
 
 
 def handle_m3u_refresh_job(
@@ -447,10 +1001,18 @@ def handle_m3u_refresh_job(
     payload: Dict[str, Any],
     progress_callback=None,
 ):
+    LOGGER.info(
+        "%s 自动执行开始：先扫描 M3U 头部 EPG，再执行频道挂流，payload=%s",
+        PLUGIN_KEY, payload,
+    )
     if progress_callback:
         progress_callback(0, 2, "正在扫描 M3U 头部 EPG")
     epg_summary = import_m3u_epg_sources(
         settings, plugin_dir, payload, progress_callback=progress_callback
+    )
+    LOGGER.info(
+        "%s 自动执行：EPG 扫描完成 created=%s existing=%s，开始频道挂流",
+        PLUGIN_KEY, epg_summary.get("created", 0), epg_summary.get("existing", 0),
     )
     if progress_callback:
         progress_callback(1, 2, "EPG 扫描完成，正在执行频道挂流")
@@ -473,6 +1035,7 @@ def handle_m3u_refresh_job(
         "epg": epg_summary,
         "assignment": assign_summary,
     }
+    LOGGER.info("%s 自动执行完成：%s", PLUGIN_KEY, combined.get("message"))
     _write_last_result(plugin_dir, combined)
     return combined
 
@@ -492,6 +1055,11 @@ def run_channel_stream_regex_job(
     started_at = _now_label()
     rules, parse_errors, rules_source = parse_rules(settings, plugin_dir)
     total_rules = len(rules)
+    LOGGER.info(
+        "%s 规则匹配开始：mode=%s 规则=%s 条 解析错误=%s 条 来源=%s",
+        PLUGIN_KEY, "dry-run" if dry_run else "write", total_rules,
+        len(parse_errors), rules_source,
+    )
     if progress_callback:
         progress_callback(
             0,
@@ -773,6 +1341,7 @@ def run_channel_stream_regex_job(
         f"更新顺序 {summary['links_reordered']} 条，"
         f"错误 {summary['errors']} 条。报告：{file_path}"
     )
+    LOGGER.info("%s 规则匹配完成：%s", PLUGIN_KEY, summary["message"])
     _write_last_result(plugin_dir, summary)
     close_old_connections()
     return summary
@@ -792,6 +1361,11 @@ def sort_existing_channel_streams(
     rules, parse_errors, rules_source = parse_rules(settings, plugin_dir)
     channels, missing_channels = _channels_for_existing_stream_sort(Channel, rules)
     total_channels = len(channels)
+    LOGGER.info(
+        "%s 已挂流重排开始：待处理 %s 个频道（%s）",
+        PLUGIN_KEY, total_channels,
+        "规则频道" if rules else "全部有挂流频道",
+    )
     if progress_callback:
         progress_callback(
             0,
@@ -910,6 +1484,7 @@ def sort_existing_channel_streams(
         f"更新顺序 {summary['links_reordered']} 条，"
         f"错误 {summary['errors']} 条。报告：{file_path}"
     )
+    LOGGER.info("%s 已挂流重排完成：%s", PLUGIN_KEY, summary["message"])
     _write_last_result(plugin_dir, summary)
     close_old_connections()
     return summary
@@ -1007,6 +1582,7 @@ def import_m3u_epg_sources(
             "status": "skipped",
             "message": "自动导入 M3U 头部 EPG 未启用，已跳过。",
         }
+        LOGGER.info("%s M3U EPG 扫描跳过：auto_import_m3u_epg 未启用", PLUGIN_KEY)
         _write_last_result(plugin_dir, result)
         return result
 
@@ -1019,6 +1595,10 @@ def import_m3u_epg_sources(
         )
     accounts = accounts.order_by("name", "id")
     total_accounts = accounts.count()
+    LOGGER.info(
+        "%s M3U EPG 扫描开始：账号过滤=%s，待扫描 %s 个账号",
+        PLUGIN_KEY, account_name or "全部启用账号", total_accounts,
+    )
     if progress_callback:
         progress_callback(
             0,
@@ -1136,6 +1716,7 @@ def import_m3u_epg_sources(
         f"复用 {summary['existing']} 个，刷新队列 {summary['refreshed']} 个。"
         f"报告：{file_path}"
     )
+    LOGGER.info("%s M3U EPG 扫描完成：%s", PLUGIN_KEY, summary["message"])
     _write_last_result(plugin_dir, summary)
     close_old_connections()
     return summary
@@ -1674,7 +2255,7 @@ def _find_channel(Channel, channel_ref: str, channel_name: str):
     ref = str(channel_ref or "").strip()
     name = str(channel_name or "").strip()
     if name:
-        channel = Channel.objects.filter(name=name).order_by("id").first()
+        channel = _find_channel_by_name_candidates(Channel, name)
         if channel:
             return channel
     if ref.isdigit():
@@ -1684,7 +2265,77 @@ def _find_channel(Channel, channel_ref: str, channel_name: str):
     name = ref
     if not name:
         return None
-    return Channel.objects.filter(name=name).order_by("id").first()
+    return _find_channel_by_name_candidates(Channel, name)
+
+
+def _find_channel_by_name_candidates(Channel, name: str):
+    for candidate in _channel_name_candidates(name):
+        channel = Channel.objects.filter(name=candidate).order_by("id").first()
+        if channel:
+            return channel
+    return None
+
+
+def _channel_name_candidates(name: str) -> List[str]:
+    stripped = str(name or "").strip()
+    if not stripped:
+        return []
+
+    base_names = [stripped]
+    base_names.extend(_cctv_descriptive_name_candidates(stripped))
+
+    seen = set()
+    unique = []
+    for base_name in base_names:
+        for candidate in _quality_suffix_name_candidates(base_name):
+            if candidate not in seen:
+                seen.add(candidate)
+                unique.append(candidate)
+    return unique
+
+
+def _quality_suffix_name_candidates(name: str) -> List[str]:
+    if name.endswith("超清"):
+        return [name]
+    candidates = [name]
+    for separator in ("", " ", "-", "_"):
+        candidates.append(f"{name}{separator}超清")
+    return candidates
+
+
+def _cctv_descriptive_name_candidates(name: str) -> List[str]:
+    match = re.fullmatch(r"(?i)CCTV[-_ ]?0?(\d+)", name)
+    if not match:
+        return []
+
+    descriptors_by_number = {
+        "1": ("综合",),
+        "2": ("财经",),
+        "3": ("综艺",),
+        "4": ("中文国际",),
+        "5": ("体育",),
+        "6": ("电影",),
+        "7": ("国防军事",),
+        "8": ("电视剧",),
+        "9": ("纪录",),
+        "10": ("科教",),
+        "11": ("戏曲",),
+        "12": ("社会与法",),
+        "13": ("新闻",),
+        "14": ("少儿",),
+        "15": ("音乐",),
+        "16": ("奥林匹克",),
+        "17": ("农业农村",),
+    }
+    number = str(int(match.group(1)))
+    descriptors = descriptors_by_number.get(number, ())
+    names = []
+    for descriptor in descriptors:
+        names.append(f"CCTV{number}{descriptor}")
+        names.append(f"CCTV{number} {descriptor}")
+        names.append(f"CCTV-{number}{descriptor}")
+        names.append(f"CCTV-{number} {descriptor}")
+    return names
 
 
 def _plan_merge(existing_links: Sequence[Any], matched_streams: Sequence[Any]):
