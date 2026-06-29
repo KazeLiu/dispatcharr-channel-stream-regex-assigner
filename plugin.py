@@ -24,6 +24,10 @@ JOB_STATE_FILE = "job_state.json"
 DAILY_SCHEDULER_STATE_FILE = "daily_scheduler_state.json"
 RULES_FILE_NAME = "channel_rules.txt"
 LEGACY_RULES_TEMPLATE_FILENAME = "channel_rules_template.txt"
+# 配置导入 / 导出：把规则文件 + 插件设置打包成 JSON，用于备份或迁移
+CONFIG_EXPORT_FORMAT = "channel_stream_regex_assigner_config"
+CONFIG_EXPORT_VERSION = 1
+CONFIG_EXPORT_FILE = "config_export.json"
 RULE_DELIMITERS = ("|||", "\t")
 PROGRESS_LOG_INTERVAL_SECONDS = 5
 JOB_STATE_STALE_SECONDS = 6 * 60 * 60
@@ -66,10 +70,10 @@ class Rule:
 
 
 class Plugin:
-    name = "频道正则挂流器"
-    version = "0.3.8"
+    name = "Channel Stream Regex Assigner"
+    version = "0.3.9"
     description = "按正则规则把 Streams 自动挂到 Channels，支持跟随 M3U 刷新自动执行、每日定时执行，并从 M3U 头部自动导入 EPG。"
-    author = "Fengbao"
+    author = "KazeLiu"
 
     fields = []
     actions = []
@@ -139,6 +143,28 @@ class Plugin:
                 "keyword": result["keyword"],
                 "scanned_count": result["scanned_count"],
                 "matched_count": result["matched_count"],
+            }
+
+        if action == "export_config":
+            result = export_config(settings, plugin_dir)
+            return {
+                "status": "ok",
+                "message": result["message"],
+                "file": result["file"],
+                "rules_chars": result["rules_chars"],
+                "settings_count": result["settings_count"],
+            }
+
+        if action == "import_config":
+            try:
+                result = import_config(settings, plugin_dir)
+            except ValueError as exc:
+                return {"status": "error", "message": str(exc)}
+            return {
+                "status": "ok",
+                "message": result["message"],
+                "rules_file": result["rules_file"],
+                "settings_updated": result["settings_updated"],
             }
 
         if action in ("preview_match", "apply_match"):
@@ -2064,6 +2090,96 @@ def _stream_export_line(stream: Any) -> str:
         f"{stream.id} | {stream.name} | {stream.url or ''} "
         f"| 源={account_name} | 分组={group_name}"
     )
+
+
+def export_config(settings: Dict[str, Any], plugin_dir: str) -> Dict[str, Any]:
+    """把当前规则文件 + 插件设置打包成 JSON 导出，供备份或迁移。只读，不改任何状态。"""
+    rules_text, _rules_path = _load_rules_text(settings, plugin_dir)
+    exportable = _exportable_settings(settings)
+    payload = {
+        "format": CONFIG_EXPORT_FORMAT,
+        "version": CONFIG_EXPORT_VERSION,
+        "rules_file": RULES_FILE_NAME,
+        "rules": rules_text,
+        "settings": exportable,
+    }
+    content = json.dumps(payload, ensure_ascii=False, indent=2)
+    file_path = _write_text_report(plugin_dir, CONFIG_EXPORT_FILE, content)
+    result = {
+        "status": "ok",
+        "message": f"配置已导出（规则 + 设置）：{file_path}",
+        "file": file_path,
+        "rules_chars": len(rules_text),
+        "settings_count": len(exportable),
+    }
+    _write_last_result(plugin_dir, result)
+    return result
+
+
+def import_config(settings: Dict[str, Any], plugin_dir: str) -> Dict[str, Any]:
+    """从「导入配置」框里的 JSON 导入：覆盖规则文件，并按已知字段更新插件设置。"""
+    raw = str(settings.get("import_config_text") or "").strip()
+    if not raw:
+        raise ValueError("导入配置为空，请先把导出的 JSON 粘贴到「导入配置」框里")
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"JSON 解析失败：{exc}")
+    if not isinstance(data, dict) or data.get("format") != CONFIG_EXPORT_FORMAT:
+        raise ValueError("配置格式不匹配，请用本插件「导出配置」生成的 JSON")
+
+    rules_text = str(data.get("rules") or "")
+    write_info = _write_rules_file(
+        plugin_dir, rules_text, overwrite=True, create_if_missing=True
+    )
+    updated = _apply_imported_settings(data.get("settings") or {})
+    result = {
+        "status": "ok",
+        "message": (
+            f"导入完成：规则已写入，更新 {updated} 项设置。"
+            "请重新打开插件页面让设置生效。"
+        ),
+        "rules_file": write_info.get("file"),
+        "settings_updated": updated,
+    }
+    _write_last_result(plugin_dir, result)
+    return result
+
+
+def _exportable_settings(settings: Dict[str, Any]) -> Dict[str, Any]:
+    """只导出 manifest 中定义的非 info 字段，避免导出临时或派生值。"""
+    known = _known_setting_ids()
+    return {key: settings[key] for key in known if key in settings}
+
+
+def _apply_imported_settings(imported: Dict[str, Any]) -> int:
+    """把导入的设置写回 PluginConfig，只接受已知字段，返回实际更新项数。"""
+    from apps.plugins.models import PluginConfig
+
+    known = _known_setting_ids()
+    try:
+        cfg = PluginConfig.objects.get(key=PLUGIN_KEY)
+    except PluginConfig.DoesNotExist:
+        return 0
+    new_settings = dict(cfg.settings or {})
+    updated = 0
+    for key, value in imported.items():
+        if key in known:
+            new_settings[key] = value
+            updated += 1
+    cfg.settings = new_settings
+    cfg.save(update_fields=["settings"])
+    return updated
+
+
+def _known_setting_ids() -> set:
+    """从本插件 manifest 提取可持久化的设置字段 id（排除 info 分区标题）。"""
+    manifest = _read_own_manifest()
+    return {
+        field["id"]
+        for field in manifest.get("fields", [])
+        if isinstance(field, dict) and field.get("id") and field.get("type") != "info"
+    }
 
 
 def _build_export_streams_report(

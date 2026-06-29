@@ -1,9 +1,12 @@
 import os
+import sys
 import tempfile
 import threading
 import time
+import types
 import unittest
 from datetime import datetime
+from unittest import mock
 
 import plugin
 
@@ -618,6 +621,74 @@ class StopAllTasksTests(unittest.TestCase):
             result = plugin._reserve_background_job(plugin_dir, "scan_m3u_epg", 0)
 
             self.assertEqual(result["status"], "queued")
+
+
+def _install_fake_plugin_config_plugin(cfg_obj):
+    """构造假的 apps.plugins.models 模块注入 sys.modules，供 _apply_imported_settings 测试。"""
+    pc = mock.MagicMock()
+    pc.objects.get.return_value = cfg_obj
+    pc.DoesNotExist = type("DoesNotExist", (Exception,), {})
+    fake_models = types.ModuleType("apps.plugins.models")
+    fake_models.PluginConfig = pc
+    return {
+        "apps": types.ModuleType("apps"),
+        "apps.plugins": types.ModuleType("apps.plugins"),
+        "apps.plugins.models": fake_models,
+    }
+
+
+class ConfigImportExportTests(unittest.TestCase):
+    def test_exportable_settings_filters_to_known_non_info_fields(self):
+        manifest = {
+            "fields": [
+                {"id": "_section_match", "type": "info"},
+                {"id": "default_mode", "type": "select"},
+                {"id": "ignore_case", "type": "boolean"},
+            ]
+        }
+        with mock.patch.object(plugin, "_read_own_manifest", return_value=manifest):
+            out = plugin._exportable_settings({
+                "default_mode": "merge",
+                "ignore_case": True,
+                "_section_match": "x",
+                "unknown_key": "y",
+            })
+        self.assertEqual(out, {"default_mode": "merge", "ignore_case": True})
+
+    def test_import_config_rejects_empty_bad_json_and_bad_format(self):
+        with mock.patch.object(plugin, "_read_own_manifest", return_value={"fields": []}):
+            with self.assertRaisesRegex(ValueError, "为空"):
+                plugin.import_config({"import_config_text": ""}, "/tmp/plugin")
+            with self.assertRaisesRegex(ValueError, "JSON 解析失败"):
+                plugin.import_config({"import_config_text": "not json"}, "/tmp/plugin")
+            with self.assertRaisesRegex(ValueError, "格式不匹配"):
+                plugin.import_config(
+                    {"import_config_text": '{"format":"something_else"}'}, "/tmp/plugin"
+                )
+
+    def test_apply_imported_settings_only_updates_known_fields(self):
+        manifest = {
+            "fields": [
+                {"id": "default_mode", "type": "select"},
+                {"id": "ignore_case", "type": "boolean"},
+            ]
+        }
+        cfg = mock.MagicMock()
+        cfg.settings = {"default_mode": "replace", "keep_me": 1}
+        fake_mods = _install_fake_plugin_config_plugin(cfg)
+        with mock.patch.object(plugin, "_read_own_manifest", return_value=manifest), \
+                mock.patch.dict(sys.modules, fake_mods):
+            updated = plugin._apply_imported_settings({
+                "default_mode": "merge",
+                "ignore_case": True,
+                "evil_key": "should_be_ignored",
+            })
+        self.assertEqual(updated, 2)
+        self.assertEqual(
+            cfg.settings,
+            {"default_mode": "merge", "keep_me": 1, "ignore_case": True},
+        )
+        cfg.save.assert_called_once_with(update_fields=["settings"])
 
 
 if __name__ == "__main__":

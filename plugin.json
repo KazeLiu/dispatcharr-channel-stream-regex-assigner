@@ -1,8 +1,8 @@
 {
-  "name": "频道正则挂流器",
-  "version": "0.3.8",
+  "name": "Channel Stream Regex Assigner",
+  "version": "0.3.9",
   "description": "按正则规则把 Streams 自动挂到 Channels，支持跟随 M3U 刷新自动执行、每日定时执行，并从 M3U 头部自动导入 EPG。",
-  "author": "Fengbao",
+  "author": "KazeLiu",
   "fields": [
     {
       "id": "usage",
@@ -193,13 +193,26 @@
       "default": "",
       "placeholder": "CCTV",
       "help_text": "点下方「导出流」按钮，把名称或 URL 包含此关键字（不区分大小写）的全部可用 Streams 导出到文件。留空则导出全部可用流。仅供排查使用，不会修改频道。"
+    },
+    {
+      "id": "_section_config",
+      "label": "配置导入 / 导出",
+      "type": "info",
+      "description": "▼ 配置导入 / 导出（备份或迁移规则文件与插件设置）"
+    },
+    {
+      "id": "import_config_text",
+      "label": "导入配置（粘贴 JSON）",
+      "type": "text",
+      "default": "",
+      "help_text": "把「导出配置」生成的 JSON 完整粘到这里，再点下方「导入配置」。会覆盖当前规则文件与设置。"
     }
   ],
   "actions": [
     {
       "id": "generate_rules",
       "label": "生成规则文件",
-      "description": "按你现有的频道清单自动生成一份初始规则文件。会覆盖 channel_rules.txt，之前手改的内容会丢失。",
+      "description": "按现有频道生成初始规则文件，覆盖 channel_rules.txt。",
       "button_label": "生成规则",
       "button_variant": "light",
       "button_color": "green",
@@ -212,7 +225,7 @@
     {
       "id": "test_regex",
       "label": "测试正则",
-      "description": "在上方「测试正则」里填一条正则，点这里扫描全部流，看看会命中哪些。只看不改频道。",
+      "description": "扫描全部流，看上方正则命中哪些。只看不改。",
       "button_label": "测试",
       "button_variant": "light",
       "button_color": "gray"
@@ -220,7 +233,7 @@
     {
       "id": "export_streams",
       "label": "导出流",
-      "description": "按上方「导出流关键字」把名称或 URL 含该词的流导出成文件（留空导出全部）。排查用，不改频道。",
+      "description": "把名称或 URL 含关键字的流导出成文件，留空导全部。",
       "button_label": "导出流",
       "button_variant": "light",
       "button_color": "gray"
@@ -228,7 +241,7 @@
     {
       "id": "preview_match",
       "label": "预览",
-      "description": "按规则文件模拟跑一遍，看每个频道会挂上哪些流，不会真的写入。执行前建议先预览。",
+      "description": "按规则模拟跑一遍，看每个频道挂哪些流，不真写入。",
       "button_label": "预览",
       "button_variant": "light",
       "button_color": "gray"
@@ -236,7 +249,7 @@
     {
       "id": "apply_match",
       "label": "立即执行",
-      "description": "按规则把流真正挂到频道上，会修改频道里的流。",
+      "description": "按规则把流真正挂到频道上，会改频道里的流。",
       "button_label": "立即执行",
       "button_variant": "filled",
       "button_color": "green",
@@ -249,28 +262,49 @@
     {
       "id": "sort_existing_streams",
       "label": "重排已挂流",
-      "description": "对频道里已有的流，按上方「关键词优先 / 订阅源优先」重新排序，默认还会清掉失效的挂流。",
+      "description": "按关键词/订阅源优先重排已有流，默认清失效挂流。",
       "button_label": "重排已挂流",
       "button_variant": "light",
       "button_color": "blue",
       "confirm": {
         "required": true,
         "title": "重排已挂流？",
-        "message": "会更新频道内已挂流的顺序，默认还会删除已失效挂流。有规则文件时只处理规则里的频道；规则文件为空时处理全部已有挂流频道。"
+        "message": "会更新频道内已挂流的顺序，默认还会删除已失效挂流。"
       }
     },
     {
       "id": "scan_m3u_epg",
       "label": "扫描 EPG",
-      "description": "从订阅的 M3U 文件开头读取 EPG 地址，自动添加到 EPG 源并拉取节目单。",
+      "description": "从 M3U 开头读 EPG 地址并加到 EPG 源。",
       "button_label": "扫描 EPG",
       "button_variant": "light",
       "button_color": "blue"
     },
     {
+      "id": "export_config",
+      "label": "导出配置",
+      "description": "把规则文件和插件设置导出成 JSON，备份或迁移用。",
+      "button_label": "导出配置",
+      "button_variant": "light",
+      "button_color": "gray"
+    },
+    {
+      "id": "import_config",
+      "label": "导入配置",
+      "description": "把上方粘贴的配置 JSON 导入，覆盖当前规则与设置。",
+      "button_label": "导入配置",
+      "button_variant": "light",
+      "button_color": "blue",
+      "confirm": {
+        "required": true,
+        "title": "导入配置？",
+        "message": "会覆盖当前规则文件和插件设置，建议先导出一份备份。"
+      }
+    },
+    {
       "id": "auto_m3u_refresh",
       "label": "模拟刷新",
-      "description": "手动模拟一次「M3U 刷新」事件，用来测试自动执行有没有接通。真实刷新时系统会自动触发。",
+      "description": "手动模拟一次 M3U 刷新，测试自动执行是否接通。",
       "button_label": "模拟刷新",
       "button_variant": "light",
       "button_color": "gray",
@@ -279,7 +313,7 @@
     {
       "id": "start_daily_scheduler",
       "label": "启动定时",
-      "description": "按上方设置的时间每天自动跑一次。改过时间要点一次才生效。",
+      "description": "按设置时间每天自动跑一次，改时间要点一次。",
       "button_label": "启动定时",
       "button_variant": "light",
       "button_color": "green"
@@ -287,7 +321,7 @@
     {
       "id": "stop_daily_scheduler",
       "label": "停止定时",
-      "description": "关掉每日自动执行。已经在跑的任务不受影响。",
+      "description": "关掉每日自动执行，已在跑的任务不受影响。",
       "button_label": "停止定时",
       "button_variant": "light",
       "button_color": "red"
@@ -295,7 +329,7 @@
     {
       "id": "stop_all_tasks",
       "label": "停止全部",
-      "description": "紧急停止：关掉定时器，并取消正在跑的后台任务。卡住时用。",
+      "description": "紧急停止：关定时器并取消正在跑的后台任务。",
       "button_label": "停止全部",
       "button_variant": "filled",
       "button_color": "red"
@@ -303,7 +337,7 @@
     {
       "id": "latest_result",
       "label": "查看结果",
-      "description": "查看上一次预览 / 执行 / 测试的结果；任务进行中会显示实时进度。",
+      "description": "查看上次预览/执行/测试结果，任务中显示进度。",
       "button_label": "查看结果",
       "button_variant": "subtle",
       "button_color": "gray"
