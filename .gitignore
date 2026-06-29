@@ -3,3 +3,6 @@ __pycache__/
 *.zip
 dist/
 .idea/
+
+# 排查用的导出/报告产物（本地临时文件，不入库）
+*_result.txt

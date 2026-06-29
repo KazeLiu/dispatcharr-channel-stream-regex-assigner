@@ -1,6 +1,6 @@
 {
-  "name": "Channel Stream Regex Assigner",
-  "version": "0.3.7",
+  "name": "频道正则挂流器",
+  "version": "0.3.8",
   "description": "按正则规则把 Streams 自动挂到 Channels，支持跟随 M3U 刷新自动执行、每日定时执行，并从 M3U 头部自动导入 EPG。",
   "author": "Fengbao",
   "fields": [
@@ -179,112 +179,134 @@
       "default": "",
       "placeholder": "^CCTV[-_ ]?1($|高清|HD)",
       "help_text": "填写后点下方「测试」按钮，扫描出该正则命中的 Streams 并生成报告，不会写入频道。"
+    },
+    {
+      "id": "_section_export",
+      "label": "流导出（调试）",
+      "type": "info",
+      "description": "▼ 流导出（调试，只读，不会修改任何频道）"
+    },
+    {
+      "id": "export_stream_keyword",
+      "label": "导出流关键字",
+      "type": "string",
+      "default": "",
+      "placeholder": "CCTV",
+      "help_text": "点下方「导出流」按钮，把名称或 URL 包含此关键字（不区分大小写）的全部可用 Streams 导出到文件。留空则导出全部可用流。仅供排查使用，不会修改频道。"
     }
   ],
   "actions": [
     {
       "id": "generate_rules",
-      "label": "生成频道规则文件",
-      "description": "按当前 Channels 生成初始规则文件，会覆盖持久规则文件 channel_rules.txt。",
+      "label": "生成规则文件",
+      "description": "按你现有的频道清单自动生成一份初始规则文件。会覆盖 channel_rules.txt，之前手改的内容会丢失。",
       "button_label": "生成规则",
       "button_variant": "light",
-      "button_color": "blue",
+      "button_color": "green",
       "confirm": {
         "required": true,
-        "title": "生成频道规则文件？",
-        "message": "这会覆盖 /data/plugin_data/channel_stream_regex_assigner/channel_rules.txt，现有手工修改会丢失。"
+        "title": "生成规则文件？",
+        "message": "这会覆盖 channel_rules.txt，现有手工修改会丢失。"
       }
     },
     {
       "id": "test_regex",
       "label": "测试正则",
-      "description": "用「测试正则」扫描 Streams，生成命中明细报告，不写入任何频道。",
+      "description": "在上方「测试正则」里填一条正则，点这里扫描全部流，看看会命中哪些。只看不改频道。",
       "button_label": "测试",
       "button_variant": "light",
-      "button_color": "cyan"
+      "button_color": "gray"
+    },
+    {
+      "id": "export_streams",
+      "label": "导出流",
+      "description": "按上方「导出流关键字」把名称或 URL 含该词的流导出成文件（留空导出全部）。排查用，不改频道。",
+      "button_label": "导出流",
+      "button_variant": "light",
+      "button_color": "gray"
     },
     {
       "id": "preview_match",
-      "label": "预览规则匹配",
-      "description": "在后台跑一遍所有规则，只生成预览报告，不写入 ChannelStream。建议执行前先预览。",
+      "label": "预览",
+      "description": "按规则文件模拟跑一遍，看每个频道会挂上哪些流，不会真的写入。执行前建议先预览。",
       "button_label": "预览",
       "button_variant": "light",
-      "button_color": "yellow"
+      "button_color": "gray"
     },
     {
       "id": "apply_match",
-      "label": "立即执行规则匹配",
-      "description": "在后台按规则写入 ChannelStream 关联，是实际的写操作。",
+      "label": "立即执行",
+      "description": "按规则把流真正挂到频道上，会修改频道里的流。",
       "button_label": "立即执行",
       "button_variant": "filled",
       "button_color": "green",
       "confirm": {
         "required": true,
         "title": "执行频道挂流？",
-        "message": "这会根据规则修改 Channel 与 Stream 的关联。建议先运行预览。"
+        "message": "这会根据规则修改频道里的流。建议先预览。"
       }
     },
     {
       "id": "sort_existing_streams",
       "label": "重排已挂流",
-      "description": "对已经挂到频道里的 Streams 按关键词优先和订阅源优先重排一次，默认还会清理失效挂流。",
+      "description": "对频道里已有的流，按上方「关键词优先 / 订阅源优先」重新排序，默认还会清掉失效的挂流。",
       "button_label": "重排已挂流",
       "button_variant": "light",
-      "button_color": "violet",
+      "button_color": "blue",
       "confirm": {
         "required": true,
         "title": "重排已挂流？",
-        "message": "这会更新频道内已挂 Streams 的顺序，默认还会删除已失效挂流。有规则文件时只处理规则里的频道；规则文件为空时处理全部已有挂流频道。"
+        "message": "会更新频道内已挂流的顺序，默认还会删除已失效挂流。有规则文件时只处理规则里的频道；规则文件为空时处理全部已有挂流频道。"
       }
     },
     {
       "id": "scan_m3u_epg",
-      "label": "扫描并导入 M3U EPG",
-      "description": "读取 M3U 文件开头的 x-tvg-url / url-tvg / tvg-url，自动添加到 EPG Sources 并拉取。",
+      "label": "扫描 EPG",
+      "description": "从订阅的 M3U 文件开头读取 EPG 地址，自动添加到 EPG 源并拉取节目单。",
       "button_label": "扫描 EPG",
       "button_variant": "light",
-      "button_color": "teal"
+      "button_color": "blue"
+    },
+    {
+      "id": "auto_m3u_refresh",
+      "label": "模拟刷新",
+      "description": "手动模拟一次「M3U 刷新」事件，用来测试自动执行有没有接通。真实刷新时系统会自动触发。",
+      "button_label": "模拟刷新",
+      "button_variant": "light",
+      "button_color": "gray",
+      "events": ["m3u_refresh"]
     },
     {
       "id": "start_daily_scheduler",
-      "label": "启动/刷新每日定时器",
-      "description": "按 Docker 容器本地时间每天定点执行一次规则匹配；运行中的匹配任务不会被其它任务打断。",
+      "label": "启动定时",
+      "description": "按上方设置的时间每天自动跑一次。改过时间要点一次才生效。",
       "button_label": "启动定时",
       "button_variant": "light",
       "button_color": "green"
     },
     {
       "id": "stop_daily_scheduler",
-      "label": "停止每日定时器",
-      "description": "停止当前进程内的每日定时器；不会中断已经开始的规则匹配任务。",
+      "label": "停止定时",
+      "description": "关掉每日自动执行。已经在跑的任务不受影响。",
       "button_label": "停止定时",
       "button_variant": "light",
       "button_color": "red"
     },
     {
       "id": "stop_all_tasks",
-      "label": "停止全部任务",
-      "description": "停止每日定时器，并请求当前后台任务协作取消；可用于解除卡住的阻塞状态。",
+      "label": "停止全部",
+      "description": "紧急停止：关掉定时器，并取消正在跑的后台任务。卡住时用。",
       "button_label": "停止全部",
       "button_variant": "filled",
       "button_color": "red"
     },
     {
       "id": "latest_result",
-      "label": "查看最近结果",
-      "description": "读取最近一次生成、测试、预览或执行报告摘要；后台任务运行中会优先显示当前任务、任务 ID 和进度百分比。",
+      "label": "查看结果",
+      "description": "查看上一次预览 / 执行 / 测试的结果；任务进行中会显示实时进度。",
       "button_label": "查看结果",
       "button_variant": "subtle",
       "button_color": "gray"
-    },
-    {
-      "id": "auto_m3u_refresh",
-      "label": "M3U 刷新后自动执行",
-      "description": "手动模拟一次 m3u_refresh 事件，用于验证自动执行链路是否通畅；真实刷新时由系统自动触发。",
-      "button_label": "手动模拟",
-      "button_variant": "subtle",
-      "button_color": "gray",
-      "events": ["m3u_refresh"]
     }
   ]
 }

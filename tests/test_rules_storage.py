@@ -444,6 +444,38 @@ class StreamSortingTests(unittest.TestCase):
         self.assertEqual([stream.id for stream in planned], [2])
         self.assertEqual([stream.id for stream in skipped], [])
 
+    def test_dedupe_keeps_priority_source_over_channel_name_match(self):
+        # 同 URL 两条流：B 源(不在优先级, 名字恰好等于频道名) vs 咪咕(在优先级+含关键词)
+        # 排序后咪咕超清应在前；去重必须保留它，不能被"名字==频道名"的隐式插队覆盖。
+        shared_url = "http://same.example.com/cctv9.m3u8"
+        streams = [
+            FakeStream(100, "CCTV9", "B源", url=shared_url),
+            FakeStream(200, "CCTV9超清", "咪咕", url=shared_url),
+        ]
+        settings = {
+            "stream_keyword_priority": "超清",
+            "stream_source_priority": "咪咕",
+        }
+        ordered = plugin._sort_streams_for_assignment(streams, settings)
+        # 模拟主流程：传入频道名作为 preferred_name（历史实现会因此插队覆盖优先级）
+        deduped, skipped = plugin._dedupe_streams_with_details(
+            ordered, preferred_name="CCTV9"
+        )
+
+        self.assertEqual([stream.id for stream in ordered], [200, 100])
+        self.assertEqual([stream.id for stream in deduped], [200])
+        self.assertEqual([stream.id for stream in skipped], [100])
+
+    def test_dedupe_keeps_first_by_url_when_no_priority_configured(self):
+        # 未配置任何优先级时，按传入顺序（id 升序）先到先得，行为可预测。
+        streams = [
+            FakeStream(100, "X", "A", url="u"),
+            FakeStream(200, "Y", "B", url="u"),
+        ]
+        deduped, skipped = plugin._dedupe_streams_with_details(streams)
+
+        self.assertEqual([stream.id for stream in deduped], [100])
+        self.assertEqual([stream.id for stream in skipped], [200])
 
 class DailySchedulerTests(unittest.TestCase):
     def tearDown(self):

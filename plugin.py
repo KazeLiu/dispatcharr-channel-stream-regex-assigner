@@ -66,8 +66,8 @@ class Rule:
 
 
 class Plugin:
-    name = "Channel Stream Regex Assigner"
-    version = "0.3.7"
+    name = "频道正则挂流器"
+    version = "0.3.8"
     description = "按正则规则把 Streams 自动挂到 Channels，支持跟随 M3U 刷新自动执行、每日定时执行，并从 M3U 头部自动导入 EPG。"
     author = "Fengbao"
 
@@ -123,6 +123,22 @@ class Plugin:
                 "matched_count": result["matched_count"],
                 "stale_scanned_count": result["stale_scanned_count"],
                 "stale_matched_count": result["stale_matched_count"],
+            }
+
+        if action == "export_streams":
+            result = export_streams(settings, plugin_dir)
+            return {
+                "status": "ok",
+                "message": (
+                    f"导出完成：扫描 {result['scanned_count']} 条可用 Streams，"
+                    f"导出 {result['matched_count']} 条；"
+                    f"关键字={result['keyword'] or '(空，导出全部)'}。"
+                    f"报告：{result['file']}"
+                ),
+                "file": result["file"],
+                "keyword": result["keyword"],
+                "scanned_count": result["scanned_count"],
+                "matched_count": result["matched_count"],
             }
 
         if action in ("preview_match", "apply_match"):
@@ -1944,6 +1960,51 @@ def test_regex(settings: Dict[str, Any], plugin_dir: str) -> Dict[str, Any]:
     return result
 
 
+def export_streams(settings: Dict[str, Any], plugin_dir: str) -> Dict[str, Any]:
+    """按关键字导出可用 Streams 到文本文件，仅供排查，不修改任何频道。
+
+    匹配规则：名称或 URL 任一包含关键字（大小写不敏感）即导出；
+    关键字为空时导出全部可用流。范围沿用 _stream_queryset 的 skip_stale/group_filter 设置。
+    """
+    from apps.channels.models import Stream
+
+    keyword = str(settings.get("export_stream_keyword") or "").strip()
+    needle = keyword.casefold()
+    qs = _stream_queryset(Stream, settings)
+    matches = []
+    scanned_count = 0
+    for stream in qs.iterator(chunk_size=1000):
+        scanned_count += 1
+        if not needle:
+            matches.append(stream)
+            continue
+        name = (stream.name or "").casefold()
+        url = (stream.url or "").casefold()
+        if needle in name or needle in url:
+            matches.append(stream)
+
+    report = _build_export_streams_report(
+        keyword=keyword,
+        scanned_count=scanned_count,
+        matches=matches,
+    )
+    file_path = _write_text_report(plugin_dir, "export_streams_result.txt", report)
+    result = {
+        "status": "ok",
+        "message": (
+            f"流导出完成：扫描 {scanned_count} 条可用 Streams，"
+            f"导出 {len(matches)} 条。报告：{file_path}"
+        ),
+        "file": file_path,
+        "keyword": keyword,
+        "scanned_count": scanned_count,
+        "matched_count": len(matches),
+    }
+    _write_last_result(plugin_dir, result)
+    return result
+
+
+
 def _build_regex_test_report(
     pattern: str,
     target: str,
@@ -1991,6 +2052,46 @@ def _build_regex_test_report(
 
 def _stream_sample_line(stream: Any) -> str:
     return f"{stream.id} | {stream.name} | {stream.url or ''}"
+
+
+def _stream_export_line(stream: Any) -> str:
+    """导出报告的单行摘要：附订阅源与分组，便于排查流的来源。"""
+    account = getattr(stream, "m3u_account", None)
+    group = getattr(stream, "channel_group", None)
+    account_name = getattr(account, "name", None) or "-"
+    group_name = getattr(group, "name", None) or "-"
+    return (
+        f"{stream.id} | {stream.name} | {stream.url or ''} "
+        f"| 源={account_name} | 分组={group_name}"
+    )
+
+
+def _build_export_streams_report(
+    keyword: str,
+    scanned_count: int,
+    matches: Sequence[Any],
+) -> str:
+    """生成流导出报告文本，风格对齐 _build_regex_test_report。"""
+    export_limit = 5000
+    lines = [
+        "Export Streams Result",
+        f"Keyword: {keyword or '(empty, export all)'}",
+        "Match fields: name + url",
+        "Case-insensitive: true",
+        f"Scanned active streams: {scanned_count}",
+        f"Exported streams: {len(matches)}",
+        "",
+        "Exported stream samples:",
+    ]
+    if matches:
+        for stream in matches[:export_limit]:
+            lines.append(_stream_export_line(stream))
+        if len(matches) > export_limit:
+            lines.append(f"... {len(matches) - export_limit} more exported streams omitted")
+    else:
+        lines.append("(none)")
+    return "\n".join(lines)
+
 
 
 def parse_rules(
@@ -2379,22 +2480,18 @@ def _dedupe_streams_with_details(
     streams: Iterable[Any],
     preferred_name: str = "",
 ) -> Tuple[List[Any], List[Any]]:
+    """按 stream.id + url 去重，保留传入顺序中先出现的流。
+
+    去重顺序完全由调用方传入的顺序决定（主流程已先用 _sort_streams_for_assignment
+    按订阅源优先 / 关键词优先排好）。preferred_name 仅作向后兼容的占位参数保留，不再
+    用于插队重排——历史上"名字等于频道名即插队最前"的隐式偏好会覆盖用户显式配置的
+    订阅源 / 关键词优先级，导致同 URL 跨订阅时保留低优先级订阅的流，并使其在频道内沉底。
+    """
     seen_ids = set()
     seen_urls = set()
     deduped = []
     skipped = []
-    preferred = str(preferred_name or "").strip().casefold()
-    ordered_streams = sorted(
-        enumerate(streams),
-        key=lambda item: (
-            0
-            if preferred
-            and str(getattr(item[1], "name", "") or "").strip().casefold() == preferred
-            else 1,
-            item[0],
-        ),
-    )
-    for _index, stream in ordered_streams:
+    for stream in streams:
         url = (stream.url or "").strip()
         if stream.id in seen_ids or (url and url in seen_urls):
             skipped.append(stream)
