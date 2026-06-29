@@ -71,7 +71,7 @@ class Rule:
 
 class Plugin:
     name = "Channel Stream Regex Assigner"
-    version = "0.3.9"
+    version = "0.3.10"
     description = "按正则规则把 Streams 自动挂到 Channels，支持跟随 M3U 刷新自动执行、每日定时执行，并从 M3U 头部自动导入 EPG。"
     author = "KazeLiu"
 

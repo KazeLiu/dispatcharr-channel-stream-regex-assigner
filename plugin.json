@@ -1,6 +1,6 @@
 {
   "name": "Channel Stream Regex Assigner",
-  "version": "0.3.9",
+  "version": "0.3.10",
   "description": "按正则规则把 Streams 自动挂到 Channels，支持跟随 M3U 刷新自动执行、每日定时执行，并从 M3U 头部自动导入 EPG。",
   "author": "KazeLiu",
   "fields": [
@@ -8,7 +8,7 @@
       "id": "usage",
       "label": "使用说明",
       "type": "info",
-      "description": "本插件按「正则规则」把现有的 Streams 挂到现有的 Channels 上，并可自动排序、自动导入 EPG。\n\n规则只从文件读取：/data/plugin_data/channel_stream_regex_assigner/channel_rules.txt\n每行格式：channel_id ||| channel_name ||| regex ||| mode ||| max_streams\n（mode 为 merge 合并 / replace 覆盖，max_streams 为 0 表示无限）\n\n推荐流程：先点「生成规则」得到初始文件 → 编辑规则 → 用「测试」或「预览」确认 → 再点「立即执行」。\n\n打开插件或执行动作时，若规则文件不存在，会自动从旧路径或随包规则迁移；仍不存在才创建空白规则文件。"
+      "description": "本插件按「正则规则」把现有的 Streams 挂到现有的 Channels 上，并可自动排序、自动导入 EPG。\n\n规则只从文件读取：/data/plugin_data/channel_stream_regex_assigner/channel_rules.txt（文件头部注释含完整字段格式、示例与注意事项）。\n\n推荐流程：先点「生成规则」得到初始文件 → 编辑规则 → 用「测试」或「预览」确认 → 再点「立即执行」。\n\n打开插件或执行动作时，若规则文件不存在，会自动从旧路径或随包规则迁移；仍不存在才创建空白规则文件。"
     },
     {
       "id": "_section_match",
@@ -65,7 +65,7 @@
       "label": "允许空匹配清空频道",
       "type": "boolean",
       "default": false,
-      "help_text": "仅 replace 模式生效。默认关闭：当一条 replace 规则没匹配到任何流时，不会清空频道；打开后才会清空，请谨慎。"
+      "help_text": "仅「覆盖」模式（replace）生效。replace 会用匹配到的流整体替换频道原有流；当一条 replace 规则没匹配到任何流时，默认保持原流不变，打开此项才会清空频道，请谨慎。"
     },
     {
       "id": "_section_filter",
