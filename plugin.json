@@ -205,7 +205,7 @@
       "label": "导入配置（粘贴 JSON）",
       "type": "text",
       "default": "",
-      "help_text": "把「导出配置」生成的 JSON 完整粘到这里，再点下方「导入配置」。会覆盖当前规则文件与设置。"
+      "help_text": "把「导出配置」生成的 JSON 完整粘到这里，再点 action 里面的「导入配置」。会覆盖当前规则文件与设置。"
     }
   ],
   "actions": [
@@ -291,7 +291,7 @@
     {
       "id": "import_config",
       "label": "导入配置",
-      "description": "把上方粘贴的配置 JSON 导入，覆盖当前规则与设置。",
+      "description": "把 Setting 粘贴的配置 JSON 导入，覆盖当前规则与设置。",
       "button_label": "导入配置",
       "button_variant": "light",
       "button_color": "blue",
